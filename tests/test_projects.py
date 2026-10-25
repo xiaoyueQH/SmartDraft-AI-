@@ -6,7 +6,8 @@ import pytest
 from sqlalchemy import func, select
 from test_auth import auth_api, headers, login  # noqa: F401
 
-from backend.agents.orchestrator import ProjectAgent, measured_tokens, request_budget
+from backend.agents.limits import measured_tokens, request_budget
+from backend.agents.orchestrator import ProjectAgent
 from backend.models.discovery import merge_discovery
 from backend.models.projects import ProjectError, ProjectItem, ProjectMessage, ProjectRun
 
@@ -244,7 +245,7 @@ async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_
     monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
     calls = []
 
-    async def complete(self, messages, *, allow_tools, max_output_tokens=4000):
+    async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
         calls.append(messages)
         if len(calls) == 1:
             import json
@@ -260,7 +261,7 @@ async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_
                             "name": "save_draft",
                             "arguments": json.dumps(
                                 {
-                                    "kind": "specification",
+                                    "kind": "change",
                                     "title": "仓库需求书",
                                     "content": "角色库管，入库增加库存，验收时查询数量一致。",
                                     "questions": ["是否需要审核？"],
@@ -276,7 +277,8 @@ async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_
     monkeypatch.setattr(ProjectAgent, "complete", complete)
     customer = headers(await login(client))
     p = await project(client, customer)
-    data = {"request_id": str(uuid4()), "content": "生成需求书"}
+    await baseline(client, customer, headers(await login(client, "admin")), p["id"])
+    data = {"request_id": str(uuid4()), "content": "生成变更需求书"}
     response = await client.post(f"/api/projects/{p['id']}/messages", headers=customer, json=data)
     assert response.status_code == 202
     run = await wait_run(client, customer, p["id"], response.json()["id"])
@@ -288,16 +290,16 @@ async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_
     assert repeated.json()["id"] == run["id"] and len(calls) == 2
     async with database.session() as session:
         assert await session.scalar(select(func.count()).select_from(ProjectMessage)) == 2
-        assert await session.scalar(select(func.count()).select_from(ProjectItem)) == 1
-        item = await session.scalar(select(ProjectItem))
+        assert await session.scalar(select(func.count()).select_from(ProjectItem)) == 2
+        item = await session.scalar(select(ProjectItem).where(ProjectItem.kind == "change"))
         assert item.status == "draft" and not item.staff_confirmed
 
 
-async def test_agent_failure_discards_prepared_drafts_and_conversation(auth_api, monkeypatch):
+async def test_agent_failure_preserves_raw_discussion_without_invented_facts(auth_api, monkeypatch):
     client, _, database = auth_api
     monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
 
-    async def complete(self, messages, *, allow_tools, max_output_tokens=4000):
+    async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
         raise TimeoutError("provider timeout secret details must never be exposed")
 
     monkeypatch.setattr(ProjectAgent, "complete", complete)
@@ -311,16 +313,21 @@ async def test_agent_failure_discards_prepared_drafts_and_conversation(auth_api,
     run = await wait_run(client, customer, p["id"], response.json()["id"])
     assert run["status"] == "failed" and "secret" not in run["answer"]
     async with database.session() as session:
-        assert await session.scalar(select(func.count()).select_from(ProjectMessage)) == 0
+        assert await session.scalar(select(func.count()).select_from(ProjectMessage)) == 2
         assert await session.scalar(select(func.count()).select_from(ProjectItem)) == 0
 
 
 async def test_chat_reloads_each_turn_trace_even_with_repeated_text(auth_api, monkeypatch):
+    import json
+
     client, _, _ = auth_api
     monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
 
-    async def complete(self, messages, *, allow_tools, max_output_tokens=4000):
-        return {"content": "我们继续确认业务。"}, {"total_tokens": 20}
+    async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
+        from test_consultation import extracted
+
+        data = json.loads(messages[1]["content"].split("以下为业务数据：", 1)[1])
+        return extracted(data["input"])
 
     monkeypatch.setattr(ProjectAgent, "complete", complete)
     customer = headers(await login(client))
@@ -362,43 +369,31 @@ async def test_discovery_remembers_business_across_turns_without_auto_creating_p
     monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
     calls = 0
 
-    async def complete(self, messages, *, allow_tools, max_output_tokens=4000):
+    async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
         nonlocal calls
         calls += 1
-        if calls == 3:
+        from test_consultation import extracted
+
+        data = json.loads(messages[1]["content"].split("以下为业务数据：", 1)[1])
+        if calls == 2:
             assert "维修门店" in messages[1]["content"] and "漏单" in messages[1]["content"]
-        if calls in {1, 3}:
-            notes = (
-                {
-                    "subject": "维修预约需求沟通",
-                    "business_background": "线下维修门店",
-                    "current_workflow": "电话接单纸本记录",
-                    "problems": ["容易漏单"],
-                    "open_questions": ["谁负责排班？"],
-                }
-                if calls == 1
-                else {
-                    "problems": ["重复预约"],
-                    "users": ["前台"],
-                    "constraints": ["单店"],
-                    "open_questions": ["希望如何预约？"],
-                }
-            )
-            return {
-                "tool_calls": [
-                    {
-                        "id": f"call_{calls}",
-                        "type": "function",
-                        "function": {
-                            "name": "remember_requirements",
-                            "arguments": json.dumps(notes, ensure_ascii=False),
-                        },
-                    }
-                ]
-            }, {"total_tokens": 100}
-        return {"content": "我了解了。接下来想了解一下，平时谁负责安排预约？"}, {
-            "total_tokens": 100
-        }
+        notes = (
+            {
+                "subject": "维修预约需求沟通",
+                "business_background": "线下维修门店",
+                "current_workflow": "电话接单纸本记录",
+                "problems": ["容易漏单"],
+                "open_questions": ["谁负责排班？"],
+            }
+            if calls == 1
+            else {
+                "problems": ["重复预约"],
+                "users": ["前台"],
+                "constraints": ["单店"],
+                "open_questions": ["希望如何预约？"],
+            }
+        )
+        return extracted(data["input"], notes)
 
     monkeypatch.setattr(ProjectAgent, "complete", complete)
     customer = headers(await login(client))
@@ -429,36 +424,44 @@ async def test_failed_turn_does_not_commit_prepared_discovery_notes(auth_api, mo
     monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
     calls = 0
 
-    async def complete(self, messages, *, allow_tools, max_output_tokens=4000):
+    async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            return {
-                "tool_calls": [
-                    {
-                        "id": "memory_1",
-                        "type": "function",
-                        "function": {
-                            "name": "remember_requirements",
-                            "arguments": json.dumps({"business_background": "不能独立保存的纪要"}),
-                        },
-                    }
-                ]
-            }, {"total_tokens": 100}
+            from test_consultation import extracted
+
+            data = json.loads(messages[1]["content"].split("以下为业务数据：", 1)[1])
+            return extracted(
+                data["input"],
+                {
+                    "business_background": "维修门店",
+                    "current_workflow": "电话登记",
+                    "users": ["前台"],
+                    "goals": ["减少漏单"],
+                    "scope": ["预约登记"],
+                },
+                draft_request_quote=data["input"],
+            )
         raise TimeoutError("provider interrupted")
 
     monkeypatch.setattr(ProjectAgent, "complete", complete)
+    from backend.db.project_store import ProjectStore
+
+    async def reject_commit(self, *args, **kwargs):
+        raise ProjectError("VERSION_CONFLICT", "资料已变更", 409)
+
+    monkeypatch.setattr(ProjectStore, "finish", reject_commit)
     customer = headers(await login(client))
     p = await project(client, customer)
     result = await client.post(
         f"/api/projects/{p['id']}/messages",
         headers=customer,
-        json={"request_id": str(uuid4()), "content": "了解业务"},
+        json={"request_id": str(uuid4()), "content": "了解业务并整理草案", "intent": "chat"},
     )
     run = await wait_run(client, customer, p["id"], result.json()["id"])
     assert run["status"] == "failed"
     detail = (await client.get(f"/api/projects/{p['id']}", headers=customer)).json()
-    assert detail["project"]["discovery"] == {} and detail["messages"] == []
+    assert detail["project"]["discovery"] == {} and len(detail["messages"]) == 2
 
 
 def test_discovery_list_additions_and_explicit_corrections_preserve_other_facts():

@@ -73,6 +73,27 @@ const comparison = ref<{
   comparing = ref(false);
 const createdToOpen = ref<Project | null>(null);
 const showNotes = ref(false);
+const searchAvailable = ref(false),
+  webSearch = ref(false);
+let toolsTimer: ReturnType<typeof setTimeout> | null = null;
+async function syncTools() {
+  try {
+    const result = await auth.request<{ web_search?: { enabled: boolean } }>(
+      "/api/agent/tools",
+    );
+    if (!disposed) {
+      searchAvailable.value = !!result.web_search?.enabled;
+      if (!searchAvailable.value) webSearch.value = false;
+    }
+  } catch {
+    if (!disposed) {
+      searchAvailable.value = false;
+      webSearch.value = false;
+    }
+  } finally {
+    if (!disposed) toolsTimer = setTimeout(syncTools, 15000);
+  }
+}
 const itemForm = reactive({
   kind: "specification" as ItemKind,
   title: "",
@@ -189,12 +210,18 @@ async function selectProject(id: string) {
   try {
     const [next, status] = await Promise.all([
       auth.request<ProjectDetail>(`/api/projects/${id}`),
-      auth.request<{ configured: boolean }>(`/api/projects/${id}/agent`),
+      auth.request<{
+        configured: boolean;
+        tools?: { web_search?: { enabled: boolean } };
+      }>(`/api/projects/${id}/agent`),
     ]);
     if (disposed || current !== generation) return;
     selected.value = id;
     detail.value = next;
     configured.value = status.configured;
+    searchAvailable.value = !!status.tools?.web_search?.enabled;
+    webSearch.value =
+      searchAvailable.value && !!next.runs[0]?.options?.web_search;
     tab.value = "conversation";
     olderItems.value = [];
     itemOffset.value = 0;
@@ -401,7 +428,7 @@ async function openCreatedConsultation(created?: Project) {
     notice.value = `沟通已创建，读取暂未完成：${errorText(error)}。请再次点击“开始需求沟通”继续打开。`;
   }
 }
-async function prepareRequirements() {
+async function regenerateRequirements() {
   if (prompt.value.trim()) {
     notice.value = "请先发送或清空当前沟通内容，再整理需求草案";
     return;
@@ -409,7 +436,7 @@ async function prepareRequirements() {
   tab.value = "conversation";
   prompt.value =
     "请根据我们已经沟通并确认的信息整理需求草案，保留尚未明确的事项，不要自动立项。";
-  await send();
+  await send("draft");
 }
 function openNewItem() {
   if (!detail.value || pending.value) return;
@@ -570,11 +597,19 @@ async function action(value: string) {
     await refresh();
   }
 }
-async function send() {
+async function send(
+  intent: "chat" | "draft" = "chat",
+  suggestion?: { id: string; accept: boolean },
+) {
   if (!prompt.value.trim() || running.value || !configured.value) return;
   const result = await write(`/api/projects/${selected.value}/messages`, {
     request_id: crypto.randomUUID(),
     content: prompt.value.trim(),
+    intent,
+    web_search: searchAvailable.value && webSearch.value,
+    accepted_suggestions: suggestion?.accept ? [suggestion.id] : [],
+    rejected_suggestions:
+      suggestion && !suggestion.accept ? [suggestion.id] : [],
   });
   if (result) {
     prompt.value = "";
@@ -583,6 +618,14 @@ async function send() {
       schedulePoll(selected.value, run.value.id, generation);
     else await refresh();
   }
+}
+async function answerSuggestion(id: string, accept: boolean) {
+  if (prompt.value.trim()) {
+    notice.value = "请先发送或清空当前输入，再确认建议";
+    return;
+  }
+  prompt.value = `我${accept ? "采纳" : "不采纳"}公开参考建议 ${id}，请记录我的选择。`;
+  await send("chat", { id, accept });
 }
 async function moreItems() {
   const current = generation;
@@ -680,6 +723,7 @@ watch(
   },
 );
 onMounted(async () => {
+  void syncTools();
   loading.value = true;
   try {
     await loadProjects(0);
@@ -695,6 +739,7 @@ onUnmounted(() => {
   disposed = true;
   generation++;
   stopPoll();
+  if (toolsTimer) clearTimeout(toolsTimer);
 });
 </script>
 
@@ -879,6 +924,8 @@ onUnmounted(() => {
           :locked="saving || !!pending"
           :sending="saving"
           :outgoing="outgoing"
+          :search-available="searchAvailable"
+          v-model:web-search="webSearch"
           @send="send"
         />
         <aside
@@ -888,6 +935,36 @@ onUnmounted(() => {
         >
           <section v-if="discovery" class="discovery-notes">
             <h3>已了解的信息</h3>
+            <template v-if="detail.project.consultation?.status"
+              ><p class="consultation-status">
+                {{
+                  detail.project.consultation.memory_pending
+                    ? "原话已保留，部分业务信息待整理"
+                    : detail.project.consultation.draft_paused
+                      ? "已暂停自动整理，您可以继续沟通"
+                      : detail.project.consultation.status === "draft_ready"
+                        ? "草案已整理，等待您查看"
+                        : detail.project.consultation.status === "ready"
+                          ? "信息已保存，需要时可整理草案"
+                          : detail.project.consultation.status ===
+                              "waiting_search"
+                            ? "准备查询公开资料"
+                            : "等待您补充业务信息"
+                }}
+              </p>
+              <ul class="consultation-gaps">
+                <li
+                  v-for="gap in [
+                    ...detail.project.consultation.conflicts,
+                    ...detail.project.consultation.gaps,
+                  ]"
+                  :key="gap.key"
+                >
+                  <strong v-if="gap.critical">请补充：</strong
+                  ><span v-else>草案中待确认：</span>{{ gap.question }}
+                </li>
+              </ul></template
+            >
             <p v-if="!knownFacts.length" class="project-muted">
               沟通中的业务信息会逐步整理在这里。
             </p>
@@ -908,7 +985,11 @@ onUnmounted(() => {
                 </li>
               </ul></template
             >
+            <p class="project-muted">
+              沟通内容会先保存；需要时直接告诉顾问“生成草案”。
+            </p>
             <button
+              v-if="detail.project.consultation?.status === 'draft_ready'"
               class="button button-outline"
               :disabled="
                 !configured ||
@@ -917,10 +998,62 @@ onUnmounted(() => {
                 !!pending ||
                 !detail.messages.length
               "
-              @click="prepareRequirements"
+              @click="regenerateRequirements"
             >
-              整理需求草案
+              重新整理草案
             </button>
+            <section
+              v-if="detail.project.consultation?.suggestions?.length"
+              class="consultation-suggestions"
+            >
+              <h4>公开参考建议</h4>
+              <article
+                v-for="suggestion in detail.project.consultation.suggestions"
+                :key="suggestion.id"
+              >
+                <p>{{ suggestion.text }}</p>
+                <template
+                  v-for="reference in detail.project.consultation.references.filter(
+                    (row) => row.id === suggestion.reference_id,
+                  )"
+                  :key="reference.id"
+                  ><a
+                    :href="reference.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >{{ reference.title }}</a
+                  ><small
+                    >搜索摘要 ·
+                    {{ new Date(reference.fetched_at).toLocaleString() }}</small
+                  ></template
+                >
+                <div
+                  v-if="isCustomer && suggestion.status === 'pending'"
+                  class="record-row-actions"
+                >
+                  <button
+                    class="text-button"
+                    :disabled="saving || running || !!pending"
+                    @click="answerSuggestion(suggestion.id, true)"
+                  >
+                    采纳</button
+                  ><button
+                    class="text-button"
+                    :disabled="saving || running || !!pending"
+                    @click="answerSuggestion(suggestion.id, false)"
+                  >
+                    不采纳
+                  </button>
+                </div>
+                <small v-else>{{
+                  suggestion.status === "accepted"
+                    ? "客户已采纳，仍需评审"
+                    : suggestion.status === "rejected"
+                      ? "客户未采纳"
+                      : "待客户确认"
+                }}</small>
+              </article>
+            </section>
           </section>
         </aside>
       </div>
@@ -1110,7 +1243,7 @@ onUnmounted(() => {
             v-model="itemForm.content"
             required
             rows="16"
-            maxlength="24000"
+            maxlength="120000"
           ></textarea></label
         ><label
           >待确认问题（每行一个，双方确认前需要补齐清空）<textarea

@@ -15,8 +15,9 @@ CLOSED = ("approved", "closed", "rejected", "withdrawn")
 
 
 class ProjectAdminStore:
-    def __init__(self, database):
+    def __init__(self, database, cache=None):
         self.database = database
+        self.cache = cache
 
     async def _authorize(self, session, principal):
         actor = await lock_identity(session, principal, shared=True)
@@ -24,6 +25,18 @@ class ProjectAdminStore:
             raise ProjectError("FORBIDDEN", "需要管理员权限", 403)
 
     async def summary(self, principal):
+        if self.cache and self.cache.settings.enabled:
+            async with self.database.session() as session:
+                await self._authorize(session, principal)
+            return await self.cache.get_or_load(
+                "summary",
+                str(principal.account.id),
+                lambda: self._summary(principal),
+                self.cache.settings.summary_ttl_seconds,
+            )
+        return await self._summary(principal)
+
+    async def _summary(self, principal):
         async with self.database.session() as session:
             await self._authorize(session, principal)
             phases = dict(

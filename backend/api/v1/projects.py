@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from backend.api.v1.auth import PrincipalDep
 from backend.db.project_store import ProjectStore
-from backend.dependencies import DatabaseDep
+from backend.db.tool_store import ToolStore
+from backend.dependencies import CacheDep, DatabaseDep
 from backend.models.projects import (
     CreateItem,
     ItemAction,
@@ -18,8 +19,8 @@ router = APIRouter(prefix="/projects", tags=["software-projects"])
 consultations_router = APIRouter(prefix="/consultations", tags=["requirement-discovery"])
 
 
-def project_store(database: DatabaseDep):
-    return ProjectStore(database)
+def project_store(database: DatabaseDep, cache: CacheDep):
+    return ProjectStore(database, cache)
 
 
 StoreDep = Annotated[ProjectStore, Depends(project_store)]
@@ -104,6 +105,7 @@ async def agent_status(
     return {
         "configured": request.app.state.project_agent.configured,
         "model": request.app.state.settings.agent.model,
+        "tools": {"web_search": await ToolStore(store.database).get(principal)},
     }
 
 

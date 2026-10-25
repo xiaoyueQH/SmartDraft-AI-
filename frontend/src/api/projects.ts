@@ -13,6 +13,28 @@ export interface Project {
   revision: number;
   phase: "discovery" | "project";
   discovery: DiscoveryNotes;
+  consultation?: {
+    status: "waiting_user" | "waiting_search" | "ready" | "draft_ready";
+    pending_search_query?: string;
+    draft_consent: boolean;
+    draft_paused?: boolean;
+    memory_pending?: boolean;
+    gaps: { key: string; question: string; critical: boolean }[];
+    conflicts: { key: string; question: string; critical: boolean }[];
+    references: {
+      id: string;
+      title: string;
+      url: string;
+      snippet: string;
+      fetched_at: string;
+    }[];
+    suggestions: {
+      id: string;
+      text: string;
+      reference_id: string;
+      status: "pending" | "accepted" | "rejected";
+    }[];
+  };
   version: number;
   deleted_at: string | null;
   deleted_by: string | null;
@@ -39,6 +61,7 @@ export interface ProjectItem {
 export interface AgentEvent {
   sequence: number;
   type: string;
+  node?: string;
   summary: string;
   tool?: string;
   ok?: boolean;
@@ -52,6 +75,7 @@ export interface AgentRun {
   prompt: string;
   created_at: string;
   events: AgentEvent[];
+  options?: { web_search?: boolean };
 }
 export interface ProjectMessage {
   id: string;

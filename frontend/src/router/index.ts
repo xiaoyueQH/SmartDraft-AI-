@@ -4,6 +4,7 @@ import AdminLayout from "../layouts/AdminLayout.vue";
 import CustomerLayout from "../layouts/CustomerLayout.vue";
 import ProjectsView from "../views/ProjectsView.vue";
 import AdminProjectsView from "../views/AdminProjectsView.vue";
+import ToolSettingsView from "../views/ToolSettingsView.vue";
 import NotFoundView from "../views/NotFoundView.vue";
 import StatusView from "../views/StatusView.vue";
 import LoginView from "../views/LoginView.vue";
@@ -89,6 +90,11 @@ export const router = createRouter({
           meta: { title: "项目详情" },
         },
         { path: "status", component: StatusView, meta: { title: "运行状态" } },
+        {
+          path: "tools",
+          component: ToolSettingsView,
+          meta: { title: "工具管理" },
+        },
         { path: "users", component: UsersView, meta: { title: "账号管理" } },
       ],
     },

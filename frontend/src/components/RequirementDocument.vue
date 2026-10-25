@@ -6,47 +6,55 @@ import DOMPurify from "dompurify";
 
 const props = defineProps<{ content: string }>();
 const svg = ref("");
-const documentHtml = computed(() =>
-  DOMPurify.sanitize(
-    marked.parse(
-      props.content.replace(
-        /```mermaid\s*\n[\s\S]*?```/g,
-        "（业务流程图见上方）",
-      ),
-      { async: false },
-    ),
-    {
-      ALLOWED_TAGS: [
-        "p",
-        "br",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "strong",
-        "em",
-        "del",
-        "ul",
-        "ol",
-        "li",
-        "blockquote",
-        "pre",
-        "code",
-        "table",
-        "thead",
-        "tbody",
-        "tr",
-        "th",
-        "td",
-        "hr",
-        "a",
-      ],
-      ALLOWED_ATTR: ["href", "title", "colspan", "rowspan"],
-    },
-  ),
-);
+const documentHtml = computed(() => {
+  const source = props.content.replace(
+    /```mermaid\s*\n[\s\S]*?```/g,
+    "（业务流程图见上方）",
+  );
+  const tokens = marked.lexer(source);
+  let previousHeading = "";
+  let retained = 0;
+  for (const token of tokens) {
+    if (token.type === "heading") {
+      if (token.text.trim() === previousHeading) {
+        continue;
+      }
+      previousHeading = token.text.trim();
+    } else if (token.type !== "space") previousHeading = "";
+    tokens[retained++] = token;
+  }
+  tokens.length = retained;
+  return DOMPurify.sanitize(marked.parser(tokens, { async: false }), {
+    ALLOWED_TAGS: [
+      "p",
+      "br",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "strong",
+      "em",
+      "del",
+      "ul",
+      "ol",
+      "li",
+      "blockquote",
+      "pre",
+      "code",
+      "table",
+      "thead",
+      "tbody",
+      "tr",
+      "th",
+      "td",
+      "hr",
+      "a",
+    ],
+    ALLOWED_ATTR: ["href", "title", "colspan", "rowspan"],
+  });
+});
 const source = computed(
   () => props.content.match(/```mermaid\s*\n([\s\S]*?)```/)?.[1] || "",
 );

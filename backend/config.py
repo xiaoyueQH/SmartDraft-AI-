@@ -68,6 +68,24 @@ class AuthSettings(BaseModel):
     login_attempts_per_minute: int = Field(default=20, ge=1, le=100)
 
 
+class CacheSettings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=16379, ge=1, le=65535)
+    database: int = Field(default=0, ge=0, le=15)
+    password: SecretStr = SecretStr("")
+    prefix: str = Field(default="supportflow:v1", pattern=r"^[a-zA-Z0-9:_-]{1,80}$")
+    max_connections: int = Field(default=16, ge=1, le=100)
+    timeout_seconds: float = Field(default=0.15, gt=0, le=1)
+    cooldown_seconds: float = Field(default=5, ge=1, le=60)
+    load_capacity: int = Field(default=8, ge=1, le=64)
+    load_wait_seconds: float = Field(default=0.25, gt=0, le=2)
+    run_ttl_seconds: int = Field(default=3, ge=1, le=5)
+    summary_ttl_seconds: int = Field(default=15, ge=1, le=30)
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     base_url: str = Field(
@@ -81,6 +99,15 @@ class AgentSettings(BaseModel):
     max_rounds: int = Field(default=5, ge=2, le=8)
     max_tools: int = Field(default=8, ge=1, le=12)
     token_budget: int = Field(default=40000, ge=4000, le=100000)
+    search_timeout_seconds: float = Field(default=6, ge=1, le=15)
+    draft_max_rounds: int = Field(default=8, ge=4, le=40)
+    draft_max_tools: int = Field(default=8, ge=2, le=32)
+    draft_token_budget: int = Field(default=64000, ge=16000, le=400000)
+    draft_output_tokens: int = Field(default=6000, ge=2000, le=16000)
+    draft_section_output_tokens: int = Field(default=2400, ge=1000, le=6000)
+    draft_run_seconds: float = Field(default=150, ge=30, le=150)
+    draft_model_timeout_seconds: float = Field(default=60, ge=5, le=90)
+    draft_history_chars: int = Field(default=200000, ge=12000, le=500000)
 
 
 class Settings(BaseSettings):
@@ -97,6 +124,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    cache: CacheSettings = Field(default_factory=CacheSettings)
 
 
 @lru_cache(maxsize=1)

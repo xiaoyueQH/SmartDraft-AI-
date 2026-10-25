@@ -9,6 +9,7 @@ const businessLinks = [
   { path: "/admin/tasks", title: "开发任务" },
   { path: "/admin/deliveries", title: "交付验收" },
   { path: "/admin/service", title: "售后工单" },
+  { path: "/admin/tools", title: "工具管理" },
 ];
 async function logout() {
   try {

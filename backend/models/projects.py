@@ -30,10 +30,11 @@ class Project(Base):
     owner_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)
     title: Mapped[str] = mapped_column(String(120))
     brief: Mapped[str] = mapped_column(Text)
-    stack: Mapped[str] = mapped_column(String(32))
+    stack: Mapped[str] = mapped_column(String(200))
     revision: Mapped[int] = mapped_column(Integer, default=0)
     phase: Mapped[str] = mapped_column(String(16), default="discovery")
     discovery: Mapped[dict] = mapped_column(JSON, default=dict)
+    consultation: Mapped[dict] = mapped_column(JSON, default=dict)
     version: Mapped[int] = mapped_column(Integer, default=1)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
@@ -121,8 +122,10 @@ class ProjectRun(Base):
     actor_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
     request_id: Mapped[UUID] = mapped_column(Uuid)
     prompt: Mapped[str] = mapped_column(Text)
+    options: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="running")
     events: Mapped[list] = mapped_column(JSON, default=list)
+    cache_version: Mapped[int] = mapped_column(Integer, default=1)
     answer: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -162,7 +165,7 @@ class DiscoveryNotes(BaseModel):
     scope: list[str] = Field(default_factory=list, max_length=20)
     constraints: list[str] = Field(default_factory=list, max_length=15)
     open_questions: list[str] = Field(default_factory=list, max_length=15)
-    technology_preference: Literal["Python", "Java", "待确认"] = "待确认"
+    technology_preference: str = Field(default="待确认", max_length=200)
 
 
 class DiscoveryUpdate(DiscoveryNotes):
@@ -176,8 +179,8 @@ class DraftItem(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     kind: Kind
     title: str = Field(min_length=1, max_length=160)
-    content: str = Field(min_length=1, max_length=24000)
-    questions: list[str] = Field(default_factory=list, max_length=20)
+    content: str = Field(min_length=1, max_length=120000)
+    questions: list[str] = Field(default_factory=list, max_length=100)
 
 
 class CreateItem(Command, DraftItem):
@@ -199,13 +202,21 @@ class ItemAction(Command):
         "supplement",
     ]
     title: str = Field(default="", max_length=160)
-    content: str = Field(default="", max_length=24000)
-    questions: list[str] = Field(default_factory=list, max_length=20)
+    content: str = Field(default="", max_length=120000)
+    questions: list[str] = Field(default_factory=list, max_length=100)
     note: str = Field(default="", max_length=3000)
 
 
 class SendMessage(Command):
     content: str = Field(min_length=1, max_length=5000)
+    intent: Literal["chat", "draft"] = Field(
+        default="chat", description="chat提交新业务信息；draft仅根据已保存信息整理草案"
+    )
+    web_search: bool = False
+    accepted_suggestions: list[str] = Field(default_factory=list, max_length=10)
+    rejected_suggestions: list[str] = Field(default_factory=list, max_length=10)
+    approved_search_query: str = Field(default="", max_length=120)
+    decline_search: bool = False
 
 
 class ProjectError(Exception):

@@ -184,8 +184,8 @@ test("workspace exposes project workflows and clearly marks unconfigured Agent",
       "交付验收",
     ])
       assert.ok(button(view.root, text));
-    assert.match(view.root.textContent, /Agent 尚未配置模型/);
-    assert.ok(button(view.root, "发送给 Agent").disabled);
+    assert.match(view.root.textContent, /业务顾问暂时不可用/);
+    assert.ok(button(view.root, "发送").disabled);
     button(view.root, "开发任务").click();
     await settle();
     assert.equal(button(view.root, "新建任务"), undefined);
@@ -330,7 +330,8 @@ test("discovery starts with business questions and hides project delivery module
       view.root.querySelector('input[placeholder="请填写项目背景"]'),
       null,
     );
-    assert.ok(button(view.root, "整理需求草案").disabled);
+    assert.equal(button(view.root, "整理需求草案"), undefined);
+    assert.match(view.root.textContent, /沟通内容会先保存；需要时直接告诉顾问/);
   } finally {
     view.close();
   }
@@ -376,6 +377,39 @@ const emptyConsultation = {
   phase: "discovery",
   discovery: {},
 };
+
+test("research preference needs no per-query approval or generation confirmation", async () => {
+  const current = {
+    ...emptyConsultation,
+    consultation: {
+      status: "waiting_user",
+      draft_consent: false,
+      gaps: [],
+      conflicts: [],
+      suggestions: [],
+      references: [],
+    },
+  };
+  const view = mount(async (path) => {
+    if (path === "/api/agent/tools") return { web_search: { enabled: true } };
+    if (path.endsWith("/agent"))
+      return { configured: true, tools: { web_search: { enabled: true } } };
+    if (path.includes("?offset=")) return { items: [current] };
+    return { ...snapshot(), project: current, items: [] };
+  });
+  try {
+    await settle();
+    assert.equal(
+      view.root.querySelector(".consultation-search-approval"),
+      null,
+    );
+    assert.equal(button(view.root, "仅允许本次查询"), undefined);
+    assert.equal(button(view.root, "整理需求草案"), undefined);
+    assert.ok(view.root.querySelector(".web-search-option input"));
+  } finally {
+    view.close();
+  }
+});
 const emptySnapshot = () => ({
   ...snapshot(),
   project: emptyConsultation,

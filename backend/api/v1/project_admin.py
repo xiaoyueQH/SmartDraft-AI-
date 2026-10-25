@@ -4,13 +4,13 @@ from fastapi import APIRouter, Depends, Query
 
 from backend.api.v1.auth import AdminDep
 from backend.db.project_admin_store import ProjectAdminStore
-from backend.dependencies import DatabaseDep
+from backend.dependencies import CacheDep, DatabaseDep
 
 router = APIRouter(prefix="/admin/projects", tags=["project-management"])
 
 
-def admin_store(database: DatabaseDep):
-    return ProjectAdminStore(database)
+def admin_store(database: DatabaseDep, cache: CacheDep):
+    return ProjectAdminStore(database, cache)
 
 
 StoreDep = Annotated[ProjectAdminStore, Depends(admin_store)]

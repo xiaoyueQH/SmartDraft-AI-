@@ -12,6 +12,7 @@ from backend.config import Settings, get_settings
 from backend.core.request_context import RequestContextMiddleware
 from backend.core.security import JwtCodec, PasswordWork, load_signing_key
 from backend.db.auth_store import AuthStore
+from backend.db.cache import ReadCache
 from backend.db.session import create_database
 from backend.services.auth import AuthService
 
@@ -22,7 +23,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database = create_database(resolved_settings.database)
+        cache = ReadCache(resolved_settings.cache)
         app.state.database = database
+        app.state.read_cache = cache
         app.state.settings = resolved_settings
         app.state.request_slots = asyncio.Semaphore(resolved_settings.app.request_capacity)
         passwords = PasswordWork(resolved_settings.auth.password_workers)
@@ -40,6 +43,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await agent.close()
             await passwords.close()
+            await cache.close()
             await database.close()
             if hasattr(app.state, "auth_service"):
                 del app.state.auth_service
@@ -47,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del app.state.settings
             del app.state.request_slots
             del app.state.project_agent
+            del app.state.read_cache
 
     app = FastAPI(title="SupportFlow API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestAdmissionMiddleware)

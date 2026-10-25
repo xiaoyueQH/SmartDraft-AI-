@@ -107,7 +107,7 @@ test("thinking expands real steps and completion retains the exact trace beside 
     });
     await settle();
     assert.equal(view.root.querySelector("details"), trace);
-    assert.match(trace.textContent, /remember_requirements/);
+    assert.match(trace.textContent, /整理业务信息/);
     assert.doesNotMatch(trace.textContent, /Skill|MCP/);
     view.state.runs[0].status = "completed";
     view.state.messages = [
@@ -133,7 +133,7 @@ test("thinking expands real steps and completion retains the exact trace beside 
     assert.ok(trace.open);
     assert.match(
       view.root.querySelector(".project-message.assistant").textContent,
-      /已完成.*remember_requirements.*谁负责预约/s,
+      /已完成.*整理业务信息.*谁负责预约/s,
     );
     const second = agentRun("run-2", { created_at: "2026-10-25T00:01:00Z" });
     view.state.runs.push(second);
@@ -170,10 +170,53 @@ test("failed execution is shown in its turn without manufacturing skill or MCP c
       view.root.querySelector(".chat-error").textContent,
       /模型服务暂不可用/,
     );
-    assert.match(view.root.querySelector("summary").textContent, /执行未完成/);
+    assert.match(view.root.querySelector("summary").textContent, /暂未完成/);
     assert.match(
       view.root.querySelector(".execution-failed").textContent,
-      /未成功/,
+      /暂未完成/,
+    );
+  } finally {
+    view.close();
+  }
+});
+
+test("a completed conversation with a failed record does not claim all steps succeeded", async () => {
+  const view = mount({
+    messages: [
+      {
+        id: "partial-user",
+        role: "user",
+        content: "登记订单",
+        run_id: "partial-record",
+      },
+      {
+        id: "partial-answer",
+        role: "assistant",
+        content: "原话已保留，纪要待核对。",
+        run_id: "partial-record",
+      },
+    ],
+    runs: [
+      agentRun("partial-record", {
+        status: "completed",
+        answer: "原话已保留，纪要待核对。",
+        events: [
+          {
+            sequence: 1,
+            type: "tool",
+            tool: "record_consultation",
+            ok: false,
+            summary: "记录失败",
+          },
+        ],
+      }),
+    ],
+  });
+  try {
+    await settle();
+    assert.match(
+      view.root.querySelector("summary").textContent,
+      /部分内容待完善/,
     );
   } finally {
     view.close();
@@ -263,6 +306,65 @@ test("old messages without a run relation are preserved without guessing a trace
     assert.equal(view.root.querySelectorAll(".project-message").length, 2);
     assert.match(view.root.textContent, /旧问题.*旧答复/s);
     assert.equal(view.root.querySelector(".chat-execution"), null);
+  } finally {
+    view.close();
+  }
+});
+
+test("the user research switch disappears when administrator availability is removed", async () => {
+  const view = mount({ searchAvailable: true, webSearch: false });
+  try {
+    await settle();
+    assert.ok(view.root.querySelector(".web-search-option input"));
+    view.state.searchAvailable = false;
+    await settle();
+    assert.equal(view.root.querySelector(".web-search-option"), null);
+  } finally {
+    view.close();
+  }
+});
+
+test("execution details use business labels and hide internal terminology", async () => {
+  const view = mount({
+    runs: [
+      agentRun("plain", {
+        events: [
+          {
+            sequence: 1,
+            type: "node",
+            node: "hitl",
+            summary: "LangGraph interrupt HITL 人工断点",
+          },
+          {
+            sequence: 2,
+            type: "tool",
+            tool: "save_draft",
+            summary: "JSON schema 校验完成",
+            duration_ms: 2500,
+            tokens: { total_tokens: 9000 },
+          },
+          {
+            sequence: 3,
+            type: "model",
+            summary: "extract node 3",
+            duration_ms: 1000,
+          },
+        ],
+        status: "failed",
+        answer: "稍后重试",
+      }),
+    ],
+  });
+  try {
+    await settle();
+    const text = view.root.querySelector(".chat-execution").textContent;
+    assert.match(text, /沟通已保存，等待您继续/);
+    assert.match(text, /整理需求草案/);
+    assert.match(text, /用时 2.5 秒/);
+    assert.doesNotMatch(
+      text,
+      /LangGraph|interrupt|HITL|人工断点|JSON|schema|save_draft|tokens|9000|extract node/,
+    );
   } finally {
     view.close();
   }

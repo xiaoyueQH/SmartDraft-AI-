@@ -13,8 +13,14 @@ const props = defineProps<{
   locked: boolean;
   sending: boolean;
   outgoing: string;
+  searchAvailable?: boolean;
+  webSearch?: boolean;
 }>();
-const emit = defineEmits<{ "update:modelValue": [value: string]; send: [] }>();
+const emit = defineEmits<{
+  "update:modelValue": [value: string];
+  send: [];
+  "update:webSearch": [value: boolean];
+}>();
 const viewport = ref<HTMLElement | null>(null),
   followLatest = ref(true);
 const running = computed(() =>
@@ -133,8 +139,7 @@ function keydown(event: KeyboardEvent) {
         <p>您目前主要做什么业务？现在有哪些事情比较费时，或者希望改善？</p>
       </article>
       <p v-if="!configured" class="notice notice-warning">
-        Agent
-        尚未配置模型。负责人需配置模型连接与密钥；现在可以在“需求与变更”中手动维护草稿，业务流程仍可使用。
+        业务顾问暂时不可用，请联系负责人。您仍可在“需求与变更”中手动整理草稿。
       </p>
       <article
         v-for="entry in timeline"
@@ -195,9 +200,26 @@ function keydown(event: KeyboardEvent) {
         @keydown="keydown"
       ></textarea>
       <div>
-        <small>Enter 发送 · Shift + Enter 换行</small
-        ><button class="button button-dark" :disabled="sendDisabled">
-          {{ running ? "正在处理…" : "发送给 Agent" }}
+        <div class="composer-options">
+          <label
+            v-if="searchAvailable"
+            class="web-search-option"
+            title="仅查询公开资料，结果作为待确认建议"
+            ><input
+              type="checkbox"
+              :checked="webSearch"
+              :disabled="locked || running"
+              @change="
+                emit(
+                  'update:webSearch',
+                  ($event.target as HTMLInputElement).checked,
+                )
+              "
+            />联网补充</label
+          ><small>Enter 发送 · Shift + Enter 换行</small>
+        </div>
+        <button class="button button-dark" :disabled="sendDisabled">
+          {{ running ? "正在处理…" : "发送" }}
         </button>
       </div>
     </form>
