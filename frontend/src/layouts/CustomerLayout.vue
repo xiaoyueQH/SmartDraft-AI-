@@ -21,6 +21,11 @@ async function logout() {
       </RouterLink>
       <nav aria-label="用户导航">
         <RouterLink to="/" exact-active-class="is-active">服务首页</RouterLink>
+        <RouterLink to="/products" active-class="is-active"
+          >商品目录</RouterLink
+        >
+        <RouterLink to="/orders" active-class="is-active">我的订单</RouterLink>
+        <RouterLink to="/returns" active-class="is-active">我的售后</RouterLink>
         <RouterLink to="/status" active-class="is-active">服务状态</RouterLink>
       </nav>
       <div class="account-actions">

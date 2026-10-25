@@ -21,6 +21,15 @@ async function logout() {
       </div>
       <p class="nav-caption">工作空间</p>
       <nav aria-label="管理导航">
+        <RouterLink to="/admin/returns" class="admin-nav-item"
+          >◇ <span>售后工单</span><span>↗</span></RouterLink
+        >
+        <RouterLink to="/admin/catalog" class="admin-nav-item"
+          >▦ <span>商品管理</span><span>↗</span></RouterLink
+        >
+        <RouterLink to="/admin/orders" class="admin-nav-item"
+          >▤ <span>订单管理</span><span>↗</span></RouterLink
+        >
         <RouterLink to="/admin" class="admin-nav-item"
           >◉ <span>运行概览</span><span>↗</span></RouterLink
         >
@@ -29,7 +38,7 @@ async function logout() {
         >
       </nav>
       <div class="sidebar-note">
-        <span class="dot"></span>账号权限 · 第二阶段
+        <span class="dot"></span>账号与订单 · 第二阶段
       </div>
     </aside>
     <div class="admin-content">

@@ -8,6 +8,10 @@ import StatusView from "../views/StatusView.vue";
 import LoginView from "../views/LoginView.vue";
 import UsersView from "../views/UsersView.vue";
 import AccountView from "../views/AccountView.vue";
+import OrdersView from "../views/OrdersView.vue";
+import ProductsView from "../views/ProductsView.vue";
+import CatalogView from "../views/CatalogView.vue";
+import ReturnsView from "../views/ReturnsView.vue";
 import { auth } from "../auth/session";
 
 export const router = createRouter({
@@ -20,6 +24,17 @@ export const router = createRouter({
       meta: { requiresAuth: true },
       children: [
         { path: "", component: HomeView, meta: { title: "服务首页" } },
+        {
+          path: "products",
+          component: ProductsView,
+          meta: { title: "商品目录" },
+        },
+        { path: "orders", component: OrdersView, meta: { title: "我的订单" } },
+        {
+          path: "returns",
+          component: ReturnsView,
+          meta: { title: "我的售后" },
+        },
         { path: "status", component: StatusView, meta: { title: "服务状态" } },
         {
           path: "account",
@@ -35,6 +50,23 @@ export const router = createRouter({
       children: [
         { path: "", component: StatusView, meta: { title: "运行概览" } },
         { path: "users", component: UsersView, meta: { title: "账号管理" } },
+        {
+          path: "returns",
+          component: ReturnsView,
+          props: { admin: true },
+          meta: { title: "售后工单" },
+        },
+        {
+          path: "catalog",
+          component: CatalogView,
+          meta: { title: "商品管理" },
+        },
+        {
+          path: "orders",
+          component: OrdersView,
+          props: { admin: true },
+          meta: { title: "订单管理" },
+        },
       ],
     },
     {

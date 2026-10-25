@@ -11,6 +11,7 @@ from backend.api.v1.auth import cookie_name
 from backend.config import AuthSettings, Settings
 from backend.db.auth_store import AuthStore
 from backend.db.session import Database
+from backend.dependencies import get_database
 from backend.main import create_app
 from backend.models.orm import Base, LoginSession, User
 
@@ -31,6 +32,7 @@ async def auth_api(tmp_path):
         ),
     )
     app = create_app(settings)
+    app.dependency_overrides[get_database] = lambda: database
     async with app.router.lifespan_context(app):
         service = app.state.auth_service
         service.store = AuthStore(database)

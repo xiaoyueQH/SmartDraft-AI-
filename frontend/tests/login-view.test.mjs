@@ -1,57 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { JSDOM } from "jsdom";
-import ts from "typescript";
-import { compileScript, parse } from "vue/compiler-sfc";
-
 import { SessionClient } from "../src/auth/client.ts";
+import { component, dom, settle, vue, vueRouter } from "./sfc-support.mjs";
 
-const dom = new JSDOM("<!doctype html><body></body>", {
-  url: "http://localhost/",
-});
-for (const key of [
-  "window",
-  "document",
-  "history",
-  "location",
-  "Element",
-  "SVGElement",
-  "HTMLElement",
-]) {
-  globalThis[key] = key === "window" ? dom.window : dom.window[key];
-}
-const vue = await import("vue");
-const vueRouter = await import("vue-router");
-
-// Compile the actual SFCs; only the auth transport is replaced in these UI tests.
-function component(file, session) {
-  const source = readFileSync(new URL(file, import.meta.url), "utf8");
-  const { descriptor } = parse(source);
-  const script = compileScript(descriptor, { id: file, inlineTemplate: true });
-  const { outputText } = ts.transpileModule(script.content, {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-    },
-  });
-  const exports = {};
-  const dependencies = { vue, "vue-router": vueRouter };
-  new Function("require", "exports", outputText)((name) => {
-    if (name.endsWith("auth/session")) return session;
-    if (dependencies[name]) return dependencies[name];
-    throw new Error(`Unexpected SFC dependency: ${name}`);
-  }, exports);
-  return exports.default;
-}
-
-const settle = async () => {
-  for (let i = 0; i < 6; i++) {
-    await new Promise((resolve) => setImmediate(resolve));
-    await vue.nextTick();
-  }
-};
 const sid = "10000000-0000-4000-8000-000000000001";
 const user = {
   id: "alice",

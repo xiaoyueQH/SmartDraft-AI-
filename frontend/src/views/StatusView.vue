@@ -163,7 +163,7 @@ onUnmounted(() => {
         <div class="milestone current">
           <span>02</span>
           <h3>账号与订单</h3>
-          <p>双令牌鉴权已接入，订单数据待实现</p>
+          <p>账号鉴权、商品、履约与退货退款</p>
         </div>
         <div class="milestone">
           <span>03</span>
@@ -177,7 +177,8 @@ onUnmounted(() => {
         </div>
       </div>
       <p class="foundation-note">
-        账号管理已接入角色校验；订单、售后及 Agent 业务将按阶段继续实现。
+        商品、订单履约与整单退货退款演示闭环已完成；真实支付物流渠道与 Agent
+        将按阶段继续接入。
       </p>
       <p v-if="snapshot?.requestId" class="request-id">
         请求编号 {{ snapshot.requestId }}
