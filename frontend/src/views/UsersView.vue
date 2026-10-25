@@ -13,7 +13,7 @@ const username = ref(""),
   role = ref<User["role"]>("user");
 const offset = ref(0),
   pageSize = 20;
-const labels = { admin: "管理员", staff: "客服", user: "用户" };
+const labels = { admin: "管理员", staff: "项目成员", user: "客户" };
 async function load(nextOffset = offset.value) {
   if (loading.value) return;
   loading.value = true;
@@ -91,8 +91,8 @@ onMounted(() => load());
             maxlength="64" /></label
         ><label
           >角色<select v-model="role">
-            <option value="user">用户</option>
-            <option value="staff">客服</option>
+            <option value="user">客户</option>
+            <option value="staff">项目成员</option>
             <option value="admin">管理员</option>
           </select></label
         ><label

@@ -118,7 +118,8 @@ export class SessionClient {
     const headers = new Headers(init.headers);
     if (sid) headers.set("X-Session-ID", sid);
     if (token) headers.set("Authorization", `Bearer ${token}`);
-    if (init.body) headers.set("Content-Type", "application/json");
+    if (init.body && !headers.has("Content-Type"))
+      headers.set("Content-Type", "application/json");
     const signals = [AbortSignal.timeout(10000)];
     if (useCurrentSignal) signals.push(this.controller.signal);
     if (init.signal) signals.push(init.signal);

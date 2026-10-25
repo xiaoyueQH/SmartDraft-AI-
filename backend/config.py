@@ -68,6 +68,21 @@ class AuthSettings(BaseModel):
     login_attempts_per_minute: int = Field(default=20, ge=1, le=100)
 
 
+class AgentSettings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1", pattern=r"^https?://[^\s\"']+$"
+    )
+    api_key: SecretStr = SecretStr("")
+    model: str = "qwen-max"
+    capacity: int = Field(default=4, ge=1, le=16)
+    timeout_seconds: float = Field(default=30, ge=1, le=45)
+    run_seconds: float = Field(default=90, ge=5, le=120)
+    max_rounds: int = Field(default=5, ge=2, le=8)
+    max_tools: int = Field(default=8, ge=1, le=12)
+    token_budget: int = Field(default=40000, ge=4000, le=100000)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SF_",
@@ -81,6 +96,7 @@ class Settings(BaseSettings):
     app: AppSettings = Field(default_factory=AppSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
 
 
 @lru_cache(maxsize=1)

@@ -1,60 +1,96 @@
-# SupportFlow
+# SupportFlow 项目说明
 
-电商售后 Agent 面试项目。基础框架、双 JWT、商品入库/编辑/上下架/回收站恢复、单商品下单与库存预占、本人/后台订单查询、确认取消、演示付款/发货/收货、整单退货审核/寄回/验收补库/演示退款关闭已实现。真实支付/退款/物流、换货和 Agent 尚未实现。演示数据已落 PostgreSQL；页面仅保留必要的演示环境说明，不在商品名或卡片重复“模拟”字样，不得冒充真实交易或已完成的 Agent。
+本仓库是软件开发业务的需求接待与售后协作 Agent，当前目录为 `D:\code\python\project`。不要修改旧医学项目。读本文件即可了解当前规则，不再沿用已移除的电商业务说明。
 
-## 目录与边界
+## 产品与真实流程
 
-- `backend/api`：总路由 `router.py`、公共中间件与错误响应；第一版接口在 `v1/`，直接由 `api/router.py` 汇总，不添加版本目录内的二次汇总层。当前 URL 仍为 `/api/...`，目录版本不改变对外路径。
-- `backend/core`：请求追踪及公共运行能力。
-- `backend/db`：异步引擎、会话及后续数据访问。
-- `backend/models`：账号 ORM、commerce 商品/订单 ORM、fulfilment 履约售后 ORM、orders/workflow 查询与命令视图。
-- `backend/services`：鉴权、订单范围校验与业务编排。
-- `backend/agents`：后续 Agent 决策；工具放 `tools/`，知识技能放 `skills/`。
-- `frontend/src/layouts`：用户端与管理端分开。
-- `scripts`：Python 启动和运维入口。
-- `tests`：后端验收测试。
+- 面向不一定懂软件的客户。客户先点击“开始需求沟通”，不要求先填项目名称、完整说明或 Java/Python 技术栈。
+- 业务顾问先了解客户在做什么业务、现在怎么处理、遇到什么问题，再随回答逐步追问参与人员、关键流程、业务规则与预期效果。每轮只问1至2个重要问题，避免长问卷和重复追问。
+- `delivery_projects.phase=discovery` 是沟通记录，尚未立项；已知事实和待确认事项保存在 discovery JSON。现有表名用于延续数据，不代表客户进入时必须创建正式项目。
+- Agent 用 `remember_requirements` 累积客户明确提供的信息，不把建议当确认事实；后续轮次带入纪要与近期对话。客户要求整理或同意整理建议后再调用 `save_draft`。
+- 需求草案：草稿 → 提交评审 → 客户与负责人分别确认。问题未补齐不可确认，编辑重置双方签名。双方确认才发布 V1，并把 phase 转成 project；名称取双方确认的需求书标题，保留沟通历史。
+- 正式项目后支持需求变更、开发任务、交付验收和售后。变更写明新增/修改/删除，并保存变更后完整需求书；双方确认发布新版，旧版不可覆盖。
+- 故障/咨询/任务/交付记录：草稿 → 提交 → 负责人处理 → 提交处理结果与依据 → 客户验收关闭；客户可退回继续处理。任务/交付仅负责人创建与维护。
+- 处理中可追加补充说明，原申请正文与历史意见保留；需求/变更可并排查看当时基线与当前完整正文，不用模型重新生成旧版内容。
+- “管理记录”支持名称检索、重命名、单条/批量移入回收站及恢复。客户仅管理本人沟通记录，正式项目由管理员管理；回收站保留对话、文档、处理历史和独立操作审计，不提供永久删除入口。手动命名不被Agent纪要或需求发布覆盖。
+- 当前角色：admin 为负责人，普通客户和 staff 仅本人记录；staff 没有跨项目权限。客户看不到后台入口。
+- 管理员首页独立于客户聊天：/admin管理总览，/admin/projects客户与项目，/admin/reviews需求审核，/admin/tasks开发任务，/admin/deliveries交付验收，/admin/service售后工单；保留账号与运行状态。按客户/项目/状态分页筛选，进入/admin/projects/:projectId后才使用项目工作区。列表操作精确定位tab/item，不直接批量批准。管理员访问用户根页转/admin。
+- 正式业务管理风：蓝灰配色、紧凑字号和间距、标准空状态；不用宣传标题、装饰符号、开发路线图或默认示例项目。不把验证记录留在客户业务中。
 
-依赖方向：配置/公共能力 → 存储与模型 → 业务/Agent → API。存储与业务层不依赖 FastAPI。新增实现必须有实际调用；不要添加通用 Repository、空工厂、未使用中间件或多 Agent 包装。
-
-## 规则
-
-- 配置统一 Pydantic Settings；根 `.env` 为本地配置，`SF_段__键` 可覆盖；密钥用 SecretStr，不输出配置原值。
-- Python 依赖只维护根 requirements.txt，pyproject 复用。不要直接修改旧 medical-ragQA 项目。
-- 用户指定使用 Conda，环境为 `D:\code\env\supportflow`；environment.yml 引用同一 requirements.txt，不创建 .venv，不修改已有环境。
-- PostgreSQL 使用 `AsyncEngine → async_sessionmaker → AsyncSession`；每个并发任务独立会话，成功提交，错误或取消回滚。
-- HTTP 有界准入与连接池上限分别管理；不得用增加连接池或进程数量代替实际压测。模型与外部工具将在真实调用入口设置独立预算，不在调用期间持有数据库事务。
-- API 生命周期创建和关闭资源；禁止导入时连库、启动时自动建业务表。接入业务时加入版本化迁移。
-- JWT 始终启用：短期 access + 轮换 refresh，角色从数据库读取，权限不可只靠前端。普通用户页面不显示后台入口，管理接口要求 admin。
-- 不同标签页可同时登录不同账号：AT 仅内存，RT 按 sid 独立 HttpOnly Cookie，sessionStorage 只存定位 ID；禁止把 token 放 localStorage、sessionStorage 或 URL。账号变化必须取消/丢弃旧请求并重建页面，不能只换头像。
-- 同 sid 刷新使用 Web Locks；不可用时明确拒绝不安全刷新，禁止并发轮换兜底。BroadcastChannel 只传播撤销 ID，不广播令牌；新标签可选择经过 Cookie 与数据库验证的已保持登录账号。
-- refresh 轮换及重放撤销使用 PostgreSQL 行锁，退出及时撤销 access 对应会话，改密撤销该账号所有会话；失败状态必须提交后再返回错误，防止撤销被异常回滚。
-- 登录限流使用 PostgreSQL 原子预算（账号与客户端两级），过期清理与预算更新分事务，禁止退回进程内字典或盲信任意 X-Forwarded-For。密码计算移出事件循环且受有界名额控制，取消请求后计算完成才归还名额。
-- 业务表使用 Alembic 迁移。普通用户后续订单/工单接口必须校验真实数据归属，不能只验证签名。
-- 订单查询固定按当前用户归属过滤；管理员跨用户查询在服务层再次校验角色。越权订单与不存在订单均为 404。金额使用整数分，订单明细保存购买时名称/SKU/单价快照，不从当前商品反算历史订单。
-- 商品/订单列表每页不超过 100，offset 不超过 10000，稳定排序且用多取一行判断下一页，不做每次全表计数。详情批量读取物流事件，不逐运单查询。
-- 演示数据通过 `scripts/seed_demo_orders.py` 显式初始化，锁定 user 账号并在一个事务写入；确定性 ID 保证重复运行不覆盖业务进度。API 启动不自动造数据。
-- 管理端 `#/admin/catalog` 使用 `services/mock_catalog.py` 的 24 款虚构候选，只读搜索不自动写库。管理员核对名称、说明、整数分售价与初始库存后入库；商品和 `catalog_imports` 来源/操作者/候选快照同事务保存。同来源候选只允许入库一次，重试返回首次商品，不重置售价、不累加库存。写事务按 user → login 共享锁重查有效登录与 admin 角色，锁等待最多 1.5 秒。不得把模拟来源标成淘宝或真实商品。
-- 商品写操作按 user → login → product 锁定；编辑、上下架、移入回收站和恢复均要求 expected_version，保存 ProductChange 审计和操作 ID 幂等结果。下单扣库存、取消归还库存、演示预占脚本均递增商品版本，过期编辑不得覆盖库存。软删除保留商品/来源/历史订单，恢复后默认下架，普通用户只看未删除且上架商品；回收站商品不得通过重复入库自动恢复。
-- 管理员可通过 `POST /api/admin/catalog/products` 手动创建自己的商品，SKU 规范化大写且唯一；request_id 按账号隔离并校验参数指纹。商品与 `catalog_imports` 中 manual 来源、原输入和指纹同事务保存，`Product.is_demo=False`；候选商品保留原来源。重复请求返回原商品，SKU 重复返回 409，回收站商品不得通过重复请求恢复。
-- `POST /api/orders` 单商品下单支持候选及手动商品，交易仍为演示环境，`Order.is_demo=True` 与商品来源标志分开；取消按真实预占释放，不比较商品来源和订单演示标志。request_id 按真实账号隔离，同 ID 不同参数返回 409。事务按 user → login → product 锁序校验状态、价格与库存，再原子保存订单、购买快照、预占并扣库存；提交后再返回订单详情。付款渠道仅为 demo，必须明确标识演示，不得伪造真实渠道成功。
-- 手动新增与候选入库统一使用原生 dialog，禁止通过改网格列数插入侧栏。保持稳定滚动条槽、背景隔离、关闭后焦点和滚动位置；未知保存结果时禁止关闭并保留原请求体重试。
-- 取消采用两阶段：预览确认单绑定订单、操作者、登录 sid、原因及快照哈希，5 分钟有效；明确确认后重新锁定核查。确认 ID 也是幂等键，完成后原 ID 重试返回原审计，不重复释放库存。网络结果未知时前端保留该 ID，只允许手动重试；不得自动换新 ID 重发。
-- 取消写事务锁顺序为操作者 user → login → order → confirmation → 本订单 reservations → 按 ID 排序 products。会话、角色在事务内重查；库存释放、预占标记、状态与审计同事务。锁等待 1.5 秒后报可重试 503。新增发货/修改明细流程必须先锁同一订单，再检查当前状态，避免绕过取消互斥。
-- 只有 pending_payment 和演示 paid 可取消；有物流、明细金额不符、预占缺失/数量不符均拒绝。真实 paid 没有退款接入前禁止取消；演示 paid 只记录 simulated，不表示真实资金退回。
-- 显式 `scripts/reserve_demo_inventory.py` 补齐可取消演示订单预占并扣库存，重复执行不重复扣减；seed_demo_orders CLI 会调用它。取消只能释放已记录的预占，不能凭历史明细直接加库存。PostgreSQL 详情多查询使用 REPEATABLE READ READ ONLY，确保状态、快照和取消审计来自同一时点。
-- 履约与售后由 WorkflowStore 实现：付款 → 发货 → 收货 → 整单退货申请 → 审核 → 寄回 → 验收补库 → 演示退款关闭。一单一个工单，驳回终态，暂不支持部分退款或换货。每单付款/退款/售后唯一；非付款动作与已付款取消必须核对完整付款凭据。发货只将预占转出库，验收补库一次并递增版本。
-- 流转按 user → login → order → case → reservations → 排序 products 加锁，业务事件与操作指纹回执同事务保存；网络结果未知保留原操作 ID，禁止切换订单和页内离开，退出登录除外。历史 SFDEMO 订单只在显式脚本中补演示付款/退款和出库凭据，出库记录不重复扣库存。细则见 docs/fulfilment.md。
-- Agent 与 LangGraph 在第三阶段加入；LangGraph 届时是必需依赖，不写缺包兼容逻辑。
-- 订单事实来自业务工具，政策来自有版本的知识库。模型不得直接写 SQL 或决定越权执行。
-- 写操作需业务校验、幂等及确认流程；外部服务设置超时，重请求增加有界并发准入，避免无界任务。
-- 不伪造支付、物流接入或业务性能；模拟数据与实际压测结果明确标记。
-- Agent 采用单 Agent + 按业务划分的工具/服务；业务差异包含参数、规则、确认及状态流转，不只换工具名称。
-- 用户要求操作白盒：接入 Agent 时同步提供真实的步骤/工具事件、结果摘要、耗时、引用、确认与失败记录。不得展示或存储私有推理、密钥、完整系统提示词及未经筛选的原始载荷；字段按工具白名单输出。
-- 执行记录必须校验会话/业务归属。通过 PostgreSQL 短事务保存权威事件，SSE 支持去重与续读，有界缓冲；模型输出不能伪造工具成功，断线不能触发重复业务操作。具体设计见 docs/agent-execution.md。
-
-## 验证
+## 代码结构与依赖
 
 ```text
+backend/
+  agents/orchestrator.py        LangGraph 单 Agent、原生工具调用、后台执行与预算
+  agents/tools/projects.py      项目资料、纪要、草案、版本比较工具
+  api/router.py                唯一总路由，main 只挂载它
+  api/v1/                      auth、health、projects（含consultations入口）
+  core/                        安全、请求追踪
+  db/session.py                异步引擎、会话工厂、独立事务
+  db/project_store.py          沟通/项目、版本、工单、执行记录的短事务
+  db/project_admin_store.py    管理员跨项目统计与分页摘要，数据库角色复核
+  db/auth_store.py             账号、可撤销登录、限流
+  db/identity.py               写操作事务内复核真实身份
+  db/migrations/               Alembic历史链，保留历史迁移，不重写已执行版本
+  models/                      auth、orm、projects
+  services/auth.py             JWT登录与账号业务
+frontend/src/
+  views/ProjectsView.vue        沟通优先的客户/负责人工作台
+  views/AdminProjectsView.vue   独立管理总览、项目及业务处理列表
+  components/RequirementDocument.vue  安全Markdown与Mermaid预览
+  style.css                    全局布局、鉴权、账号、状态样式
+  workspace.css                当前业务工作区样式
+scripts/                       启动、迁移、正式账号创建
+```
+
+依赖方向为配置/公共能力 → 模型与存储 → 业务与 Agent → API。存储与业务不得依赖FastAPI、Starlette或main。不增加空工厂、通用Repository、多Agent套壳或无调用模块。旧电商运行代码、测试与脚本已移除；历史表保留，旧接口不再挂载。清理前的未提交文件在忽略提交的 storage/cleanup-archive 中可恢复，不导入运行。
+
+## 工程与安全
+
+- Conda环境：`D:\code\env\supportflow`，不用.venv。依赖只维护根requirements.txt，pyproject/environment.yml复用。
+- 配置统一Pydantic Settings，根.env本机配置，SF_段__键覆盖；密钥SecretStr，不输出配置/供应商异常原文。
+- PostgreSQL采用 AsyncEngine → async_sessionmaker → AsyncSession；每个并发操作独立短事务，成功提交，异常/取消回滚。模型和外部工具期间不得持有SQL事务。
+- API生命周期创建并关闭资源；无导入时连库、启动自动建业务表或自动造数据。结构变更用Alembic；未知历史表不被autogenerate擅自删除。
+- JWT access+轮换refresh始终启用；角色与会话有效性从数据库复核。账号停用、退出、改密撤销旧会话。
+- 不同标签页支持不同账号：AT仅内存，RT按sid独立HttpOnly Cookie，sessionStorage仅存sid。禁止令牌进URL/localStorage/sessionStorage。
+- 同sid刷新用Web Locks；不支持时拒绝不安全刷新。BroadcastChannel仅传撤销ID。账号切换取消/丢弃旧请求并重建页面。
+- 登录限流用数据库原子预算；密码计算移出事件循环并限制并发。refresh轮换/重放撤销使用行锁，撤销失败结果先提交再返回错误。
+- 写操作锁顺序 user → login → project → item/run，1.5秒锁等待；事务中复核身份/归属。越权与不存在统一404。
+- request_id按操作者隔离，校验参数指纹；版本号防止过期覆盖。业务与审计同事务；未知写结果保留原请求重试，禁止换ID重复提交。
+- 记录管理以Project.version防过期批量操作，锁项目与运行记录；有未结束Agent执行时拒绝删除。批量变更全部校验后单事务提交；删除记录的详情、文档与Agent入口均404，恢复后沿用原ID和历史。删除当前记录清空其输入/执行状态并选择下一条，重命名保留输入。
+- 列表每页≤100、offset≤10000，多取一条判断下一页；异步读取带项目代次，防止旧响应覆盖新选择。
+- 开始沟通的防重锁覆盖创建及后续读取全程；切换记录保留原工作区，详情/模型状态就绪后一次更新，不先清空造成闪动。普通客户当前未使用的空白沟通直接复用并保留输入；创建成功但读取失败只重开原记录，不再创建。
+
+## Agent执行
+
+- LangGraph是必需依赖；单Agent按上下文选工具，禁止关键词硬路由或缺包兼容分支。
+- 工具仅整理纪要/草稿；发布、审批、立项和关闭仍由真实角色确认。模型不能直接写SQL、越权、自动承诺工期费用或伪造开发测试成功。
+- 纪要列表有序去重累积，已解答问题仅通过resolved_questions移除，客户明确纠正的事实通过remove_facts移除；本轮多个补丁按顺序保留，禁止整字段覆盖历史列表。
+- 纪要、草稿、对话成对原子提交；任一失败不保存孤立问题或半份纪要。无模型配置时明确提示，不用模板冒充模型。
+- 默认每进程4个后台执行、每轮最多5次模型调用/8次工具调用/3份草稿；限制外部超时、整轮时长、上下文与token预算。请求前保守预留输入、限制输出；usage缺失时回退计量，超额不保存。
+- 项目行锁+运行记录唯一索引提供跨进程互斥。任务目前在API进程运行，不声称已有持久化队列。180秒中断回收持run锁重新检查，禁止覆盖已完成结果。
+- 显示实际工具/纪要保存/模型轮次、耗时与用量，不展示私有推理、完整提示词、密钥或原始载荷。Markdown白名单清洗，Mermaid strict，不加载远程图片。
+- 沟通使用ConversationPanel连续聊天窗口：历史独立滚动，输入区固定在面板底部，高度适配当前屏幕；上翻历史时不抢滚动。执行记录放在每轮助手消息内，“正在思考”可展开真实事件，空闲时没有常驻执行面板。Skill/MCP仅展示真实类型事件，不制造调用记录。
+- 聊天工作区由布局flex分配剩余屏幕，不按顶部文档坐标或760px上限计算高度。工具栏/项目信息紧凑，输入区两行；窄屏业务纪要按钮展开。管理员详情同路由前进/后退也复核未确认写操作，按projectId/tab/item刷新并丢弃旧响应。
+- 新消息对与ProjectRun通过run_id同事务关联，详情返回当前消息对应的执行记录及最近5次执行；旧无关联消息保留原文，不按相同问题文字猜测归属。请求尚未确认时显示正在发送/结果待确认，与实际模型执行区分。
+- 当前只有文本资料与Markdown导出。没有附件解析、向量RAG、代码仓库集成、自动开发、自动报价或自动排期；有真实需求和调用再加。
+
+## 启动与验证
+
+```powershell
+conda activate D:\code\env\supportflow
+python scripts/migrate.py
+python scripts/start_api.py
+# 另一个终端在frontend中执行 npm run dev
+# 首次正式部署：python scripts/create_user.py admin --role admin
+```
+
+API8091、前端5183、PostgreSQL15432。页面只通过/api代理。不要把开发验证账号和样例数据放入正式初始化。
+
+修改中只运行受影响检查，收尾集中检查一次，通过且代码未变不重复跑；只有并发相关改动才补相应并发检查。审核使用用户指定的 GPT-5.6 Luna，medium中档：主审一次，修复后只复核相关部分。
+
+```powershell
+$env:SUPPORTFLOW_TEST_POSTGRES="1"
 python -m pytest -q
 python -m ruff check backend scripts tests
 python -m ruff format --check backend scripts tests
@@ -64,5 +100,4 @@ npm run format:check
 npm run build
 ```
 
-用户此前指定 GPT-5.6 Luna 审查代码；工具支持时使用该模型，不得用其他模型审查后声称使用了 Luna。
-
+PostgreSQL测试在隔离schema运行并清理，真实模型验收也使用临时schema，禁止留下示例项目污染客户列表。

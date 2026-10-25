@@ -49,6 +49,12 @@ async def test_live_and_ready(api):
     assert ready.headers["cache-control"] == "no-store"
 
 
+async def test_removed_commerce_routes_are_not_exposed(api):
+    _, client, _ = api
+    for path in ("/api/products", "/api/orders", "/api/admin/catalog/candidates"):
+        assert (await client.get(path)).status_code == 404
+
+
 @pytest.mark.parametrize("mode", ["failed", "slow"])
 async def test_database_failure_keeps_api_live_and_details_private(api, mode):
     _, client, stub = api

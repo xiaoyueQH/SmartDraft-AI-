@@ -12,15 +12,10 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from backend.config import AuthSettings, get_settings
 from backend.core.security import JwtCodec, PasswordWork
 from backend.db.auth_store import AuthStore
-from backend.db.order_store import OrderStore
 from backend.db.session import Database, create_database
-from backend.models.auth import AuthError, Principal
-from backend.models.commerce import Order, Product
-from backend.models.orders import OrderNotFound
+from backend.models.auth import AuthError
 from backend.models.orm import Base
 from backend.services.auth import AuthService, TokenBundle
-from backend.services.orders import OrderService
-from scripts.seed_demo_orders import seed_orders
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SUPPORTFLOW_TEST_POSTGRES") != "1",
@@ -221,47 +216,3 @@ async def test_real_postgres_password_change_wins_over_refresh(postgres_auth):
         with pytest.raises(AuthError):
             await service.authenticate(bundle.access_token)
     assert (await service.authenticate(bob.access_token)).account.username == "bob"
-
-
-async def test_real_postgres_order_seed_is_atomic_and_idempotent(postgres_auth):
-    from sqlalchemy import func, select
-
-    auth = postgres_auth
-    await auth.create_user("user", "Demo", "user", "Demo-test-password")
-    database = auth.store.database
-    counts = await asyncio.gather(seed_orders(database), seed_orders(database))
-    assert sorted(counts) == [0, 5]
-    async with database.session() as session:
-        assert await session.scalar(select(func.count()).select_from(Order)) == 5
-        assert await session.scalar(select(func.count()).select_from(Product)) == 3
-        order = await session.scalar(select(Order).where(Order.status == "paid").with_for_update())
-        order.status = "cancelled"
-        changed_id = order.id
-    assert await seed_orders(database) == 0
-    async with database.session() as session:
-        assert (await session.get(Order, changed_id)).status == "cancelled"
-
-
-async def test_real_postgres_parallel_order_reads_remain_owner_scoped(postgres_auth):
-    auth = postgres_auth
-    owner = await auth.create_user("user", "Demo", "user", "Demo-test-password")
-    other = await auth.store.find_user("alice")
-    await seed_orders(auth.store.database)
-    orders = OrderService(OrderStore(auth.store.database))
-    owner_principal, other_principal = Principal(owner, uuid4()), Principal(other, uuid4())
-    page = await orders.list_orders(owner_principal)
-    shipped = next(item.id for item in page.items if item.status == "shipped")
-
-    async def read(index):
-        principal = owner_principal if index % 2 == 0 else other_principal
-        listing = await orders.list_orders(principal)
-        assert len(listing.items) == (5 if index % 2 == 0 else 0)
-        if index % 2 == 0:
-            detail = await orders.detail(principal, shipped)
-            assert detail.customer_username == "user"
-            assert len(detail.shipments[0].events) == 2
-        else:
-            with pytest.raises(OrderNotFound):
-                await orders.detail(principal, shipped)
-
-    await asyncio.gather(*(read(index) for index in range(24)))

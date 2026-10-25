@@ -1,33 +1,39 @@
 # SupportFlow
 
-面向电商售后的 Agent 项目，按阶段实现。当前完成基础框架，已进入 **阶段 2：账号权限与业务数据**，其中账号权限已实现。
+面向 Java / Python 软件开发团队的需求与售后协作 Agent。客户先与业务顾问沟通，逐渐明确业务与问题；需求草案由客户与负责人确认后才正式立项并建立基线，后续新增、修改、删除功能通过变更单处理，故障和使用咨询通过工单跟进。
 
-已有：Vue 3 + TypeScript 用户端/管理端、FastAPI、Pydantic Settings、异步 PostgreSQL、健康检查、请求追踪、有界准入、Alembic 迁移、JWT access/refresh、登录续期、账号管理、改密与标签页账号隔离；管理员选品入库、编辑、上下架、回收站恢复，用户单商品下单与库存预占，本人/后台订单查询、购买快照、两阶段确认取消、库存释放和审计；演示付款、管理员发货、用户收货、整单退货审核、寄回、验收补库、演示退款与工单关闭。
+## 当前可用流程
 
-尚未实现：知识检索、LangGraph、换货、部分退款、购物车、真实支付/退款/物流对接。用户端要求登录，管理端及账号接口要求 admin，普通用户页面没有后台入口；商品同时支持演示候选和管理员自己的资料，交易与物流仍为演示环境。商品名称和卡片不重复显示“模拟”标签，页面顶部保留环境说明。
+- 客户直接点击“开始需求沟通”，不用填写项目名称、完整说明或技术栈。管理员为指定客户发起沟通；普通账号没有后台入口。
+- 业务顾问先问业务情况和现有做法，再随回答逐步追问，每次1至2个问题。通过remember_requirements持续整理已知事实与待确认问题，不重复索要完整需求。
+- 沟通阶段phase=discovery，仅显示对话、已了解的信息和需求草案。客户同意整理后才生成草案，双方确认发布V1时转为正式项目，开放交付与售后模块。
+- 项目沟通：单 Agent + LangGraph 原生工具循环，读取本项目资料、对比需求基线、准备需求/变更/故障/咨询草稿；负责人还可准备任务与交付记录。
+- 需求与变更：草稿 → 提交 → 客户与负责人分别确认 → 发布新版基线。待确认问题未清空不能发布，修改草稿清除既有签名，已发布原文不可覆盖。变更正文须包含变更说明和变更后完整需求书。
+- 售后、任务与验收：草稿 → 提交 → 负责人处理 → 提交结果与依据 → 客户验收关闭；未通过可退回继续处理。处理说明和历史操作保留。
+- 处理过程中可追加补充说明；需求变更提供旧基线与当前正文并排核对，发布新版本后仍保留旧版。
+- 页面“管理记录”可搜索、重命名、单条或批量移入回收站、恢复记录。客户管理本人沟通记录，正式项目由管理员管理；对话、文档与操作历史保留。正在执行Agent的记录须等执行结束再删除。
+- 管理后台使用独立总览及跨项目的客户、需求审核、开发任务、交付验收、售后工单列表；支持客户/项目/状态筛选，点击具体记录后进入对应项目与处理弹窗。管理员登录进入/admin，普通客户不显示管理菜单。
+- 需求书提供 Markdown 预览、导出和 Mermaid 流程图；模型产生的 HTML 经清洗，不加载文档中的远程图片。
+- 展示实际模型轮次、工具事件、耗时与用量，不显示私有推理。工具只能准备草稿，不能替双方确认或宣称完成开发。
+- 沟通窗口历史独立滚动，底部输入；每轮回复中的“正在思考/已完成”可展开实际调用与耗时，记录随该轮消息保存。右侧保留业务纪要；不显示空执行面板。
+
+本版资料入口为自然语言沟通、累计纪要与手动文档；尚未实现附件上传解析、语义向量检索、GitHub/Jira 对接、代码生成执行、自动报价或自动排期。Agent 未配置时明确提示，手动流程可继续，不以模板冒充模型。
 
 ## 本地启动
 
-需要 Conda、Node.js 22.12+、Docker Compose。Python 统一使用独立 Conda 环境 `D:\code\env\supportflow`，不使用 `.venv`。默认端口为 API `8091`、前端 `5183`、PostgreSQL `15432`，与旧项目分开。
-
-在项目根目录创建环境并安装依赖：
+使用 Conda Python 3.12、Node.js 22.12+、Docker Compose。当前本机环境 `D:\code\env\supportflow`；依赖统一维护根 requirements.txt。
 
 ```powershell
-conda env create --prefix D:\code\env\supportflow --file environment.yml
 conda activate D:\code\env\supportflow
-Copy-Item .env.example .env
-```
-
-修改 `.env` 中的本地数据库密码；本文件由 Git 忽略。启动独立 PostgreSQL：
-
-```powershell
+python -m pip install -r requirements.txt
+# 首次部署复制 .env.example 为 .env，已有环境保留原文件和数据库密码。
 docker compose --env-file .env -f docker/compose.yaml up -d --wait
 python scripts/migrate.py
 python scripts/create_user.py admin --role admin --display-name 管理员
 python scripts/start_api.py
 ```
 
-另一个终端启动前端：
+另一个终端：
 
 ```powershell
 cd frontend
@@ -35,86 +41,55 @@ npm ci
 npm run dev
 ```
 
-- 用户端：<http://127.0.0.1:5183/>，未登录时进入登录页。
-- 管理端：<http://127.0.0.1:5183/#/admin>，账号管理位于 `#/admin/users`，仅管理员可访问。
-- API 文档：<http://127.0.0.1:8091/docs>
-- 存活检查：`GET /api/health/live`
-- 就绪检查：`GET /api/health/ready`，数据库未就绪时返回 503，不伪报健康。
+- 客户工作台：http://127.0.0.1:5183/#/
+- 负责人工作台：http://127.0.0.1:5183/#/admin
+- 账号管理：#/admin/users；运行状态：#/admin/status。
+- API 文档：http://127.0.0.1:8091/docs
+- PostgreSQL：127.0.0.1:15432，数据库/用户 supportflow，密码保存在被忽略的 .env；账号位于 public.users。
+- 首次使用scripts/create_user.py交互创建管理员，再由管理员开通客户。现有账号保留；启动不会初始化示例账号或项目。
 
-没有启动 PostgreSQL 也能启动 API 和查看页面，数据服务会显示未就绪。启动脚本可以从其他目录运行；`.env` 始终按项目根定位。前端始终通过 `/api` 代理访问；更改 API 地址时可设置 `SUPPORTFLOW_API_TARGET`。构建后的静态文件部署代理将在部署阶段提供，`npm run preview` 只预览静态页面，不代理 API。
+## 模型配置
 
-首次创建管理员使用隐藏密码输入，密码至少 12 个字符，没有固定默认账号密码。已有账号无需重复创建；后续更新运行迁移即可，不自动重建表。登录与查询账号需要 PostgreSQL 和迁移就绪。完整双令牌及浏览器多账号说明见 [鉴权设计](docs/authentication.md)。
+在被忽略的根 .env 配置 OpenAI 兼容的 Chat Completions 服务，要求支持原生 tool_calls：
 
-本地演示可在迁移完成后改用 `python scripts/seed_demo_users.py`，按项目约定创建 `admin / 123456`（管理员）和 `user / 123456`（普通用户）。这是显式运行的演示初始化，不会随服务启动自动创建。密码仍以 Argon2 散列保存；重复执行保留已有账号的密码和角色。正式账号继续使用交互创建命令和至少 12 位密码。
-
-默认数据库连接为 `127.0.0.1:15432`，数据库与数据库用户名均为 `supportflow`，密码见根目录忽略提交的 `.env` 中 `SF_DATABASE__PASSWORD`。账号在 `public.users` 表中；Docker 使用 `supportflow_postgres_data` 命名卷持久化，不是 SQLite 文件。
-
-初始化本地业务演示（先运行迁移和演示账号脚本）：
-
-```powershell
-python scripts/migrate.py
-python scripts/seed_demo_users.py
-python scripts/seed_demo_orders.py
+```dotenv
+SF_AGENT__BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+SF_AGENT__MODEL=qwen-max
+SF_AGENT__API_KEY=在本机填写
+SF_AGENT__CAPACITY=4
+SF_AGENT__TIMEOUT_SECONDS=30
+SF_AGENT__RUN_SECONDS=90
+SF_AGENT__TOKEN_BUDGET=40000
 ```
 
-脚本为 `user` 创建 3 个演示商品和 5 笔订单，初始覆盖待付款、待发货、运输中、已签收、已取消；随后为可取消演示订单建立库存预占。重复执行不重置已有订单或库存，仅为缺少预占的可取消演示订单扣减相应库存一次。用户端入口为 `#/products`、`#/orders`，后台为 `#/admin/orders`；订单支持状态/完整订单号筛选、物流详情及两阶段取消。新开通的用户没有订单时显示空列表，不会共享演示用户的订单。
-
-表结构、接口与并发边界见 [订单查询说明](docs/orders.md)。
-
-管理员在 `#/admin/catalog` 搜索显卡、笔记本电脑、键盘、耳机、显示器等 24 款虚构候选，确认入库后可编辑名称、说明、售价与库存，也可上下架、移入回收站及恢复。普通用户在 `#/products` 只能看到上架且未删除的商品；选择数量、核对金额后可创建待付款订单，再在 `#/orders` 确认取消并释放库存。不需要淘宝权限或任何外部密钥。已有环境运行迁移并重启 API 即可使用，详见 [商品管理与下单闭环](docs/catalog.md)。
-
-录入自己的商品：点击商品管理右上角“新增商品”，填写 SKU、名称、说明、销售价格和初始库存，确认入库后自动显示在“已入库目录”。SKU 唯一，重复创建会明确提示。新增与候选入库均采用弹窗，打开时不会挤压卡片、改变列数或跳动按钮位置；支持窄屏和 Esc 关闭。请求结果未知时保留原表单和请求，手动重试不会重复创建。
-
-已有演示订单升级取消功能时，运行 `python scripts/migrate.py` 和 `python scripts/reserve_demo_inventory.py`，再重启 API。订单详情中填写原因、检查条件、勾选核对并确认即可取消。已付款演示订单只记录模拟退款，不会向支付渠道发起退款；真实已付款、已发货或已签收订单禁止直接取消。完整规则见 [取消闭环](docs/cancellation.md)。
-
-完整履约与售后：用户在订单详情确认演示付款，管理员登记发货，用户确认收货后可申请整单退货；管理员审核，用户登记退货运单，管理员验收补库后登记演示退款并关闭工单。用户 `#/returns` 与管理员 `#/admin/returns` 分别查看本人/全部工单。付款、退款、工单和事件都持久化，支持原操作 ID 重试，流程图与接口见 [履约与售后闭环](docs/fulfilment.md)。升级到迁移 `0007_order_workflow` 后，显式执行上述预占脚本为历史 SFDEMO 订单补演示付款和出库记录，不重复扣减历史发货库存。
-
-停止本项目数据库：
-
-```powershell
-docker compose --env-file .env -f docker/compose.yaml down
-```
-
-命名卷保留数据；已初始化后只修改 `.env` 不会更改 PostgreSQL 中的账号密码。
+修改后重启 API。密钥不出现在页面、日志或 Git 中。默认每进程4个Agent执行名额；每轮最多5次模型调用、8次工具调用、3份草稿，并限制上下文与累计模型用量。请求前按UTF-8字节保守预留输入预算并限制输出，响应按总用量或输入/输出之和计量；供应商不返回用量时按预留上限计量，超额本轮失败且不保存草稿。模型/工具期间不持有数据库事务。跨进程以 PostgreSQL 项目行锁和运行记录唯一索引互斥；HTTP请求立即返回执行ID，刷新后可继续查询，不会重复执行。后台任务随API进程运行，崩溃后超过180秒的记录在读取或新请求时标记失败，需人工重新发送；尚无跨进程任务队列。
 
 ## 结构
 
 ```text
 backend/
-  agents/            Agent 边界，tools/ 与 skills/ 分开，阶段 3 实现
-  api/               总路由、公共中间件与错误格式
-    router.py        统一挂载 /api
-    v1/              第一版接口
-  core/              请求追踪
-  db/                异步引擎与事务会话
-  models/            账号、商品订单 ORM 与查询视图
-  services/          鉴权、订单归属与业务编排
-  config.py          冻结配置快照
-  dependencies.py    HTTP 依赖注入
-  main.py            应用工厂与资源生命周期
+  agents/orchestrator.py          单 Agent 决策 / 工具循环与执行预算
+  agents/tools/projects.py        有权限边界的项目工具
+  api/router.py                   总路由
+  api/v1/projects.py              项目、需求、工单、执行记录接口
+  db/session.py                   AsyncEngine → async_sessionmaker → AsyncSession
+  db/project_store.py             项目事务、版本、确认、幂等和执行保存
+  db/migrations/versions/0011_*    沟通阶段和累计纪要迁移（保留历史数据）
+  models/projects.py              项目数据与命令校验
 frontend/src/
-  api/               接口访问
-  layouts/           用户端与管理端
-  router/            路由
-  views/             页面
-scripts/             启动入口
-tests/               配置、事务、生命周期与接口验证
-docker/              当前只编排 PostgreSQL
-requirements.txt     唯一 Python 依赖清单
+  views/ProjectsView.vue           客户/负责人项目工作台
+  components/RequirementDocument.vue  安全文档与流程图预览
+  api/projects.ts                 业务类型
 ```
 
-路由按 `main → api/router.py → v1/ 具体接口` 装配。当前接口地址保持 `/api/...`，`v1/` 仅用于代码组织；新增接口直接在 `api/router.py` 中注册。
-
-PostgreSQL 最大连接数为每 API 进程 `pool_size + max_overflow`，默认 5 + 5，共 10 个。取连接默认最多等 3 秒，建立连接 3 秒，执行 SQL 5 秒；慢查询和闲置事务有服务端超时保护。增加 API 进程前需要计算整个部署的连接总预算。
-
-HTTP 每进程默认最多 64 个请求执行，等待 0.25 秒仍无名额返回 503 / `SERVER_BUSY` 和 `Retry-After`。异常与取消都会释放名额，存活检查不受此名额限制。该准入只覆盖 HTTP；未来接入 WebSocket 时需按每轮业务请求控制，空闲连接不占模型名额。模型/工具还需在真实调用入口设置独立并发预算。
-
-事务由 `Database.session()` 管理；不在整个流式对话期间持有连接。后续将按“读取业务事实 → 调用模型/外部工具 → 短事务校验并保存”的顺序组织业务。确认动作需要重新校验订单状态。
+JWT access/refresh、每标签页账号隔离、短事务、有界HTTP准入、数据库连接池继续沿用。项目所有读取/写入校验本人归属或管理员身份；工单操作使用版本号与请求ID防止覆盖和重复提交。客户先进行业务访谈，提出整理后形成需求草案，补齐问题并经双方确认后立项；后续通过变更和售后记录跟进。
 
 ## 验证
 
+改动过程中仅运行相关测试，收尾集中验证一次。PostgreSQL测试使用隔离的临时schema并自行清理，不修改业务数据：
+
 ```powershell
-conda activate D:\code\env\supportflow
+$env:SUPPORTFLOW_TEST_POSTGRES="1"
 python -m pytest -q
 python -m ruff check backend scripts tests
 python -m ruff format --check backend scripts tests
@@ -124,28 +99,4 @@ npm run format:check
 npm run build
 ```
 
-SQLite 驱动仅用于不依赖 PostgreSQL 的事务测试；生产配置只接受 PostgreSQL + asyncpg。SQLite 测试不能代替真实 PostgreSQL 连接池、锁和业务并发验收。
-
-本地 PostgreSQL 启动后，可显式启用集成验收：
-
-```powershell
-$env:SUPPORTFLOW_TEST_POSTGRES = "1"
-python -m pytest -q
-Remove-Item Env:SUPPORTFLOW_TEST_POSTGRES
-```
-
-集成测试使用独立的随机 `acceptance_*` schema，验证 32 个并发写事务、请求取消回滚、连接池耗尽超时及慢查询后连接恢复；结束时清理自己的测试 schema。仅对本项目的本地测试库执行。这些是基础设施验收，不代表真实 Agent 业务的吞吐能力。
-
-完整履约、售后、Chrome 双账号及 24/64 并发 HTTP 读取结果见 [业务验收报告](docs/verification.md)。可运行 `python scripts/check_business_load.py --users admin user --concurrency 24 --requests 240` 复跑本机只读业务基线，密码交互输入；不包含 Agent 或真实支付渠道的性能。
-
-`environment.yml` 只定义 Conda 的 Python/pip 与 `requirements.txt` 引用，不重复维护 Python 包版本。更新依赖后，在激活的环境中运行 `python -m pip install -r requirements.txt`。不修改已有 `medical_rag` 环境。
-
-## 后续阶段
-
-1. **售后政策**：商品、下单、取消、履约和整单退货退款演示闭环已完成，下一步维护有版本的售后政策及边界案例，供后续 Agent 查询。
-2. **售后 Agent**：业务稳定后接入单 Agent + LangGraph，复用订单查询、取消预览等业务工具，写入保持独立的用户确认；同步提供真实执行时间线、结果摘要、耗时和失败恢复。
-3. **闭环与验收**：工单状态机、人工接管、后台任务、外部超时兜底和真实 Agent 并发测试。
-
-数据来源将区分公开数据、中文适配与自行生成；独立保存评估案例。不以数据行数充当业务完成度。
-
-Agent 操作白盒设计已记录在 [docs/agent-execution.md](docs/agent-execution.md)，包括用户/客服可见范围、结构化事件、确认机制、短事务保存、SSE 续读与并发边界。目前是设计，尚未实现运行中的 Agent 或执行时间线，不展示虚构执行结果。
+旧电商运行代码、页面、接口、测试、初始化脚本与重复文档已移除。历史数据库表与迁移链保留，避免破坏已有数据。删除前的70个文件保存在本机忽略提交的 `storage/cleanup-archive/commerce-before-removal-20261025.zip`，不参与运行。客户已有沟通与项目记录未删除。

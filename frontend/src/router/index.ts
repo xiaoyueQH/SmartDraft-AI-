@@ -2,16 +2,13 @@ import { createRouter, createWebHashHistory } from "vue-router";
 
 import AdminLayout from "../layouts/AdminLayout.vue";
 import CustomerLayout from "../layouts/CustomerLayout.vue";
-import HomeView from "../views/HomeView.vue";
+import ProjectsView from "../views/ProjectsView.vue";
+import AdminProjectsView from "../views/AdminProjectsView.vue";
 import NotFoundView from "../views/NotFoundView.vue";
 import StatusView from "../views/StatusView.vue";
 import LoginView from "../views/LoginView.vue";
 import UsersView from "../views/UsersView.vue";
 import AccountView from "../views/AccountView.vue";
-import OrdersView from "../views/OrdersView.vue";
-import ProductsView from "../views/ProductsView.vue";
-import CatalogView from "../views/CatalogView.vue";
-import ReturnsView from "../views/ReturnsView.vue";
 import { auth } from "../auth/session";
 
 export const router = createRouter({
@@ -23,18 +20,8 @@ export const router = createRouter({
       component: CustomerLayout,
       meta: { requiresAuth: true },
       children: [
-        { path: "", component: HomeView, meta: { title: "服务首页" } },
-        {
-          path: "products",
-          component: ProductsView,
-          meta: { title: "商品目录" },
-        },
-        { path: "orders", component: OrdersView, meta: { title: "我的订单" } },
-        {
-          path: "returns",
-          component: ReturnsView,
-          meta: { title: "我的售后" },
-        },
+        { path: "", component: ProjectsView, meta: { title: "需求沟通" } },
+        { path: "projects", redirect: "/" },
         { path: "status", component: StatusView, meta: { title: "服务状态" } },
         {
           path: "account",
@@ -48,25 +35,61 @@ export const router = createRouter({
       component: AdminLayout,
       meta: { requiresAuth: true, adminOnly: true },
       children: [
-        { path: "", component: StatusView, meta: { title: "运行概览" } },
-        { path: "users", component: UsersView, meta: { title: "账号管理" } },
         {
-          path: "returns",
-          component: ReturnsView,
-          props: { admin: true },
+          path: "",
+          component: AdminProjectsView,
+          props: { section: "overview" },
+          meta: { title: "管理工作台" },
+        },
+        {
+          path: "projects",
+          component: AdminProjectsView,
+          props: (route) => ({
+            section: "projects",
+            initialPhase: ["discovery", "project"].includes(
+              String(route.query.phase),
+            )
+              ? route.query.phase
+              : "",
+          }),
+          meta: { title: "客户与项目" },
+        },
+        {
+          path: "reviews",
+          component: AdminProjectsView,
+          props: { section: "reviews" },
+          meta: { title: "需求审核" },
+        },
+        {
+          path: "tasks",
+          component: AdminProjectsView,
+          props: { section: "tasks" },
+          meta: { title: "开发任务" },
+        },
+        {
+          path: "deliveries",
+          component: AdminProjectsView,
+          props: { section: "deliveries" },
+          meta: { title: "交付验收" },
+        },
+        {
+          path: "service",
+          component: AdminProjectsView,
+          props: { section: "service" },
           meta: { title: "售后工单" },
         },
         {
-          path: "catalog",
-          component: CatalogView,
-          meta: { title: "商品管理" },
+          path: "projects/:projectId",
+          component: ProjectsView,
+          props: (route) => ({
+            projectId: route.params.projectId,
+            initialTab: route.query.tab,
+            initialItemId: route.query.item,
+          }),
+          meta: { title: "项目详情" },
         },
-        {
-          path: "orders",
-          component: OrdersView,
-          props: { admin: true },
-          meta: { title: "订单管理" },
-        },
+        { path: "status", component: StatusView, meta: { title: "运行状态" } },
+        { path: "users", component: UsersView, meta: { title: "账号管理" } },
       ],
     },
     {
@@ -84,6 +107,7 @@ router.beforeEach(async (to) => {
     const user = await auth.ensureSession();
     if (!user) return { path: "/login", query: { next: to.fullPath } };
     if (to.meta.adminOnly && user.role !== "admin") return "/";
+    if (user.role === "admin" && to.path === "/") return "/admin";
     return true;
   } catch {
     return {

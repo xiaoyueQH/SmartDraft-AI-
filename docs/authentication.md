@@ -40,7 +40,7 @@ python scripts/create_user.py admin --role admin --display-name 管理员
 python scripts/start_api.py
 ```
 
-密码通过隐藏交互输入，不提供固定默认密码或公开注册。其他账号由管理员页面开通，也可使用同一 CLI。客服角色已定义，专用客服工单工作台待业务阶段实现；当前管理接口仅允许 admin。
+密码通过隐藏交互输入，不提供固定默认密码或公开注册。其他账号由管理员页面开通，也可使用同一 CLI。staff是项目成员角色，当前与客户一样仅能访问本人记录；跨客户评审与管理仅允许admin。
 
 随机签名密钥默认原子创建并持久化于 Git 忽略的 `storage/auth/jwt.key`。生产可通过 `SF_AUTH__SIGNING_KEY` 注入至少 32 字节密钥，多实例必须共享密钥及数据库。HTTPS 部署开启 `SF_AUTH__COOKIE_SECURE=true` 并配置 `SF_AUTH__ALLOWED_ORIGINS` 为精确来源 JSON 数组。
 

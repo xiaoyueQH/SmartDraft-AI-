@@ -66,20 +66,18 @@ async function submit() {
   <main class="login-page">
     <section class="login-story">
       <div class="brand brand-light">
-        <span class="brand-symbol">s<span>f</span></span
-        ><span>SupportFlow<small>服务有进度，沟通有依据。</small></span>
+        <span class="brand-symbol">SF</span
+        ><span>SupportFlow<small>项目协作管理系统</small></span>
       </div>
       <div>
-        <p class="eyebrow">YOUR SERVICE, CONNECTED</p>
-        <h1>把每一个问题，<br />接着处理好。</h1>
-        <p>订单、服务与每一次沟通，<br />都从属于你自己的空间。</p>
+        <h1>项目协作管理系统</h1>
+        <p>需求管理 · 变更评审 · 交付验收 · 售后工单</p>
       </div>
       <small>每个标签页，可以独立登录不同账号。</small>
     </section>
     <section class="login-form-panel">
       <form class="login-form" @submit.prevent="submit">
-        <p class="eyebrow">WELCOME BACK</p>
-        <h2>{{ route.query.switch ? "登录另一个账号" : "登录服务空间" }}</h2>
+        <h2>{{ route.query.switch ? "登录另一个账号" : "账号登录" }}</h2>
         <p class="form-description">使用管理员为你开通的账号登录。</p>
         <p v-if="message" role="alert" class="notice notice-warning">
           {{ message }}
@@ -96,7 +94,7 @@ async function submit() {
             <span
               >{{ saved.user.display_name
               }}<small>{{ saved.user.username }}</small></span
-            ><span>继续 ↗</span></button
+            ><span>继续</span></button
           ><span class="chooser-divider">或输入其他账号</span>
         </div>
         <label for="username">账号</label
@@ -121,7 +119,7 @@ async function submit() {
           :disabled="busy"
           placeholder="请输入密码"
         /><button class="button button-dark" type="submit" :disabled="busy">
-          {{ busy ? "正在登录…" : "登录" }} <span>↗</span>
+          {{ busy ? "正在登录…" : "登录" }}
         </button>
         <p class="login-help">
           保持登录，到期自动续期。退出只影响当前登录会话。

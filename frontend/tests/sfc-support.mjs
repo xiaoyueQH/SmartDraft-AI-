@@ -17,6 +17,7 @@ dom.window.HTMLDialogElement.prototype.close = function () {
 for (const key of [
   "window",
   "document",
+  "Document",
   "history",
   "location",
   "Element",

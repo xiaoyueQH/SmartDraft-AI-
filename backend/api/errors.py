@@ -8,10 +8,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
 
 from backend.models.auth import AuthError
-from backend.models.cancellation import CancellationError
-from backend.models.catalog import CandidateNotFound
-from backend.models.commerce_errors import CommerceError
-from backend.models.orders import OrderNotFound
+from backend.models.projects import ProjectError
 
 logger = logging.getLogger("supportflow.errors")
 
@@ -26,22 +23,12 @@ def error_response(request: Request, status: int, code: str, message: str) -> JS
 
 
 def register_error_handlers(app: FastAPI) -> None:
-    @app.exception_handler(CommerceError)
-    async def handle_commerce_error(request: Request, exc: CommerceError) -> JSONResponse:
+    @app.exception_handler(ProjectError)
+    async def handle_project_error(request: Request, exc: ProjectError) -> JSONResponse:
         response = error_response(request, exc.status, exc.code, exc.message)
         response.headers["Cache-Control"] = "no-store"
-        return response
-
-    @app.exception_handler(CandidateNotFound)
-    async def handle_missing_candidate(request: Request, exc: CandidateNotFound) -> JSONResponse:
-        response = error_response(request, 404, "CANDIDATE_NOT_FOUND", "候选商品不存在，请重新搜索")
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
-    @app.exception_handler(CancellationError)
-    async def handle_cancellation_error(request: Request, exc: CancellationError) -> JSONResponse:
-        response = error_response(request, exc.status, exc.code, exc.message)
-        response.headers["Cache-Control"] = "no-store"
+        if exc.status == 503:
+            response.headers["Retry-After"] = "3"
         return response
 
     @app.exception_handler(PoolTimeoutError)
@@ -59,12 +46,6 @@ def register_error_handlers(app: FastAPI) -> None:
         if retryable:
             response.headers["Retry-After"] = "2"
         logger.error("database_request_failed error_type=%s sqlstate=%s", type(exc).__name__, code)
-        return response
-
-    @app.exception_handler(OrderNotFound)
-    async def handle_missing_order(request: Request, exc: OrderNotFound) -> JSONResponse:
-        response = error_response(request, 404, "ORDER_NOT_FOUND", "订单不存在")
-        response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.exception_handler(AuthError)
