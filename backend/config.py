@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
+from backend.core.llm.models import ModelProfile
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -93,6 +95,9 @@ class AgentSettings(BaseModel):
     )
     api_key: SecretStr = SecretStr("")
     model: str = "qwen-max"
+    consultation: ModelProfile = Field(default_factory=ModelProfile)
+    draft_planner: ModelProfile = Field(default_factory=ModelProfile)
+    draft_writer: ModelProfile = Field(default_factory=ModelProfile)
     capacity: int = Field(default=4, ge=1, le=16)
     timeout_seconds: float = Field(default=30, ge=1, le=45)
     run_seconds: float = Field(default=90, ge=5, le=120)
@@ -100,11 +105,11 @@ class AgentSettings(BaseModel):
     max_tools: int = Field(default=8, ge=1, le=12)
     token_budget: int = Field(default=40000, ge=4000, le=100000)
     search_timeout_seconds: float = Field(default=6, ge=1, le=15)
-    draft_max_rounds: int = Field(default=8, ge=4, le=40)
+    draft_max_rounds: int = Field(default=12, ge=4, le=40)
     draft_max_tools: int = Field(default=8, ge=2, le=32)
     draft_token_budget: int = Field(default=64000, ge=16000, le=400000)
     draft_output_tokens: int = Field(default=6000, ge=2000, le=16000)
-    draft_section_output_tokens: int = Field(default=2400, ge=1000, le=6000)
+    draft_section_output_tokens: int = Field(default=4000, ge=1000, le=6000)
     draft_run_seconds: float = Field(default=150, ge=30, le=150)
     draft_model_timeout_seconds: float = Field(default=60, ge=5, le=90)
     draft_history_chars: int = Field(default=200000, ge=12000, le=500000)

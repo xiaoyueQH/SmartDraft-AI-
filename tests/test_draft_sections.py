@@ -4,9 +4,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 
-from backend.agents.drafting import service
-from backend.agents.drafting.agent import DraftAgent
+from backend.agents.drafting.graph import create_draft
+from backend.agents.drafting.nodes import DraftNodes
 from backend.agents.drafting.state import DraftState
 from backend.models.consultation import ConsultationState
 from backend.models.drafting import DraftPlan
@@ -47,7 +48,7 @@ class AgentFlow:
         self.state = ConsultationState()
         self.snapshot = {"project": {"version": 1, "title": "业务管理"}}
         self.options = {"web_search": web}
-        self.rounds, self.calls = 0, 0
+        self.rounds, self.calls, self.tokens = 0, 0, 0
         self.agent = SimpleNamespace(
             settings=SimpleNamespace(
                 draft_history_chars=200000,
@@ -56,6 +57,7 @@ class AgentFlow:
                 draft_section_output_tokens=2400,
                 draft_max_rounds=8,
                 draft_max_tools=8,
+                draft_token_budget=64000,
             ),
             client=object(),
         )
@@ -103,24 +105,32 @@ async def test_agent_observes_tool_results_then_selects_next_action():
             ),
         ]
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and flow.section_writes == ["functions", "goals"]
     conversations = [
         kwargs["conversation"] for system, _, kwargs in flow.models if "DRAFT_AGENT" in system
     ]
     assert any(m["role"] == "tool" and json.loads(m["content"])["ok"] for m in conversations[-1])
+    assert not any("plan_draft" in str(m) for m in conversations[-1])
     assert "导入格式待确认" in result["document"]["questions"]
     assert "员工不能退款" in result["document"]["content"]
     written = [data for system, data, _ in flow.models if "DRAFT_SECTION" in system]
+    assert all(
+        kwargs["purpose"] == ("draft_writer" if "DRAFT_SECTION" in system else "draft_planner")
+        for system, _, kwargs in flow.models
+    )
     assert "店主确认收款后扣库存" in written[1]["written_sections"]["functions"]["excerpt"]
     assert written[0]["written_sections"] == {}
+    decisions = [(system, data) for system, data, _ in flow.models if "DRAFT_AGENT" in system]
+    assert all(data["remaining_budget"]["tokens"] == 64000 for _, data in decisions)
+    assert len(decisions[1][0].encode("utf-8")) < len(decisions[0][0].encode("utf-8")) // 2
 
 
 async def test_model_can_choose_one_shot_without_program_size_branch():
     body = "# 需求草案\n\n## 业务范围\n" + "订单登记和库存查询按已说明岗位分工实施。" * 9
     flow = AgentFlow([{"content": body}])
     flow.notes["scope"] = [f"功能{i}" for i in range(20)]
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and len(flow.models) == 1
     assert "write_prd_section" in str(flow.models[0][2]["tools"])
 
@@ -134,7 +144,7 @@ async def test_section_failure_returns_observation_and_retains_other_sections():
         ],
         fail_section="functions",
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and len(flow.models) == 5
     assert "本章暂未生成" in result["document"]["content"]
     assert "private" not in str(result) + str(flow.events)
@@ -152,15 +162,28 @@ async def test_duplicate_write_does_not_repeat_model_work():
             tools(call("write_prd_section", SPECS[0]), call("finish_draft", {})),
         ]
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and flow.section_writes == ["goals"]
+
+
+async def test_completed_outline_finalizes_without_another_decision_or_duplicate_write():
+    flow = AgentFlow(
+        [
+            tools(*plan_calls(), call("write_prd_section", SPECS[0])),
+            tools(call("write_prd_section", SPECS[1])),
+        ]
+    )
+    result = await create_draft(flow, checkpointer=InMemorySaver())
+    assert not result["partial"]
+    assert flow.section_writes == ["goals", "functions"] and flow.rounds == 4
+    assert flow.calls == 3
 
 
 async def test_finishing_early_keeps_missing_outline_sections_as_partial():
     flow = AgentFlow(
         [tools(*plan_calls(), call("write_prd_section", SPECS[0]), call("finish_draft", {}))]
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and "本章暂未生成" in result["document"]["content"]
 
 
@@ -174,7 +197,7 @@ async def test_model_failure_keeps_already_written_chapters():
         return await original(system, data, **kwargs)
 
     flow.model = model
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and len(flow.models) == 2
     assert "店主确认收款后扣库存" in result["document"]["content"]
 
@@ -187,10 +210,10 @@ async def test_state_and_facts_are_isolated_between_concurrent_invocations():
         DraftState(business_notes=first.notes).model_copy(deep=True),
         DraftState(business_notes=second.notes).model_copy(deep=True),
     )
-    one, two = DraftAgent(first, a), DraftAgent(second, b)
+    one, two = DraftNodes(first, a), DraftNodes(second, b)
     await asyncio.gather(
-        one.tools.call(call("write_prd_section", SPECS[0])["function"], False),
-        two.tools.call(call("write_prd_section", SPECS[1])["function"], False),
+        one.toolset.call(call("write_prd_section", SPECS[0])["function"], False),
+        two.toolset.call(call("write_prd_section", SPECS[1])["function"], False),
     )
     assert set(a.sections) == {"goals"} and set(b.sections) == {"functions"}
     a.business_notes["scope"].append("局部修改")
@@ -209,14 +232,14 @@ async def test_cancellation_and_permission_revocation_are_not_partial_success(ca
 
     flow.model = model
     with pytest.raises(asyncio.CancelledError if cancel else ProjectError):
-        await service.create_draft(flow)
+        await create_draft(flow, checkpointer=InMemorySaver())
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_search_can_be_selected_after_writing_and_admin_switch_is_rechecked(
     monkeypatch, enabled
 ):
-    from backend.agents.drafting import tools as draft_tools
+    from backend.agents.tools import drafting as draft_tools
 
     flow = AgentFlow(
         [
@@ -246,7 +269,7 @@ async def test_search_can_be_selected_after_writing_and_admin_switch_is_rechecke
 
     monkeypatch.setattr(draft_tools.ToolStore, "get", get)
     monkeypatch.setattr(draft_tools, "search_public", search)
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and len(switches) == 2 and len(queries) == int(enabled)
     if enabled:
         assert flow.models[-1][1]["public_references"]
@@ -261,7 +284,7 @@ async def test_unknown_tool_or_bad_arguments_return_safe_feedback():
             tools(call("write_prd_section", SPECS[0]), call("finish_draft", {})),
         ]
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and "private" not in str(flow.events)
     assert (
         json.loads(flow.models[1][2]["conversation"][1]["content"])["code"]
@@ -281,7 +304,7 @@ async def test_deadline_preserves_completed_chapter_and_commit_reserve():
         return await original(system, data, **kwargs)
 
     flow.model = model
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and asyncio.get_running_loop().time() - started < 2
     assert "店主确认收款后扣库存" in result["document"]["content"]
 
@@ -303,7 +326,7 @@ async def test_oversized_native_batch_keeps_completed_actions_within_actual_tool
         ]
     )
     flow.agent.settings.draft_max_tools = 2
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and flow.calls == 2
     assert flow.section_writes == ["goals"]
     assert "店主确认收款后扣库存" in result["document"]["content"]
@@ -323,7 +346,7 @@ async def test_local_finalization_succeeds_after_processing_budget_is_fully_used
         ]
     )
     flow.agent.settings.draft_max_tools = 3
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and flow.calls == 3
     assert flow.section_writes == ["goals", "functions"]
     assert result["document"]["questions"] == ["外部邮件账号需接入"]
@@ -341,7 +364,7 @@ async def test_invalid_finalization_does_not_grant_unlimited_free_tool_actions()
         ]
     )
     flow.agent.settings.draft_max_tools = 1
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and flow.calls == 1
     finish_events = [e for e in flow.events if e.get("tool") == "finish_draft"]
     assert len(finish_events) == 1 and finish_events[0]["ok"] is False
@@ -360,7 +383,7 @@ async def test_write_reads_canonical_outline_by_id_without_repeating_title_and_f
             ),
         ]
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and flow.section_writes == ["goals", "functions"]
     writes = [data for system, data, _ in flow.models if "DRAFT_SECTION" in system]
     assert writes[1]["current_section"]["title"] == SPECS[1]["title"]
@@ -384,7 +407,7 @@ async def test_writer_resolves_local_outline_display_ids_without_rewriting_facts
             )
         ]
     )
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert flow.section_writes == ["goals"]
     assert "业务目标" in result["document"]["content"]
 
@@ -413,12 +436,15 @@ async def test_auto_choices_are_saved_as_proposals_not_customer_facts():
         ]
     )
     flow.notes["open_questions"] = ["使用什么技术栈？"]
-    result = await service.create_draft(flow)
+    original_notes = copy.deepcopy(flow.notes)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"] and flow.state.draft_assumptions[0].value == assumption["value"]
     assert "自动补充方案（可调整）" in result["document"]["content"]
-    assert assumption["value"] in result["document"]["content"]
+    assert "【自动生成】" + assumption["value"] in result["document"]["content"]
     assert "使用什么技术栈？" not in result["document"]["questions"]
     assert "technology_preference" not in flow.notes
+    assert flow.notes == original_notes
+    assert result["document"]["questions"] == []
 
 
 async def test_explicit_customer_stack_removes_old_auto_technology_from_context():
@@ -437,9 +463,11 @@ async def test_explicit_customer_stack_removes_old_auto_technology_from_context(
         DraftAssumption(category="operations", topic="邮件实现", value="Node.js Nodemailer"),
     ]
     flow.notes["technology_preference"] = "Java和Spring Boot"
-    result = await service.create_draft(flow)
+    result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"]
     context = flow.models[0][1]
     assert context["previous_assumptions"] == []
     assert context["business_notes"]["technology_preference"] == "Java和Spring Boot"
     assert "Python FastAPI" not in result["document"]["content"]
+    facts = result["document"]["content"].split("## 客户已说明的信息", 1)[1]
+    assert "Java和Spring Boot" in facts and "【自动生成】" not in facts

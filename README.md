@@ -1,114 +1,129 @@
-# SupportFlow
+# SupportFlow 项目说明
 
-面向软件开发团队的需求与售后协作 Agent。客户先与业务顾问沟通，逐渐明确业务与问题；需求草案由客户与负责人确认后才正式立项并建立基线，后续新增、修改、删除功能通过变更单处理，故障和使用咨询通过工单跟进。
+面向软件开发业务的需求接待与项目协作 Agent。客户先用自然语言讲业务，顾问累计需求；起草智能体主动补齐工程细节，输出可供技术评审、任务拆分和开发使用的详细草案。客户未选择的设计标为 **【自动生成】**，后续以客户新要求为准。
 
-## 当前可用流程
+草案经客户与负责人分别确认后发布V1，再进入需求变更、开发任务、交付验收与售后闭环。当前实现不包含自动开发、自动报价或自动排期。
 
-- 客户直接点击“开始需求沟通”，不用填写项目名称、完整说明或技术栈。管理员为指定客户发起沟通；普通账号没有后台入口。
-- 顾问结合上下文自然解释、给建议和比较取舍，必要时再问关键问题。普通沟通默认一次模型调用，新增事实通过工具记录并核对来源；纯解释可直接回答。
-- 沟通阶段phase=discovery，仅显示对话、已了解的信息和需求草案。仅客户明确要求时调用独立起草服务；起草前先保存沟通，失败保留原话与已核实信息。双方确认发布V1后才转为正式项目，开放交付与售后模块。
-- 需求访谈为主顾问加独立起草子Agent；正式项目使用业务Agent原生工具循环，读取本项目资料、对比基线并准备需求/变更/故障/咨询草稿；负责人还可准备任务与交付记录。
-- 需求与变更：草稿 → 提交 → 客户与负责人分别确认 → 发布新版基线。待确认问题未清空不能发布，修改草稿清除既有签名，已发布原文不可覆盖。变更正文须包含变更说明和变更后完整需求书。
-- 售后、任务与验收：草稿 → 提交 → 负责人处理 → 提交结果与依据 → 客户验收关闭；未通过可退回继续处理。处理说明和历史操作保留。
-- 处理过程中可追加补充说明；需求变更提供旧基线与当前正文并排核对，发布新版本后仍保留旧版。
-- 页面“管理记录”可搜索、重命名、单条或批量移入回收站、恢复记录。客户管理本人沟通记录，正式项目由管理员管理；对话、文档与操作历史保留。正在执行Agent的记录须等执行结束再删除。
-- 管理后台使用独立总览及跨项目的客户、需求审核、开发任务、交付验收、售后工单列表；支持客户/项目/状态筛选，点击具体记录后进入对应项目与处理弹窗。管理员登录进入/admin，普通客户不显示管理菜单。
-- 需求书提供 Markdown 预览、导出和 Mermaid 流程图；模型产生的 HTML 经清洗，不加载文档中的远程图片。
-- 记录实际模型、工具事件、耗时与用量；客户只见易懂步骤和耗时，不显示Token、原始参数或私有推理。工具只能准备草稿，不能替双方确认或宣称完成开发。
-- 沟通窗口历史独立滚动，底部输入；每轮回复中的“正在思考/已完成”可展开实际调用与耗时，记录随该轮消息保存。右侧保留业务纪要；不显示空执行面板。
+## 文档入口
 
-本版资料入口为自然语言沟通、累计纪要与手动文档；尚未实现附件上传解析、语义向量检索、GitHub/Jira 对接、代码生成执行、自动报价或自动排期。Agent 未配置时明确提示，手动流程可继续，不以模板冒充模型。
+从[文档导航](docs/文档导航.md)开始。三个智能体均有业务流程图、实际LangGraph节点图和模拟执行：
 
-需求沟通节点、人工断点和联网控制的完整协议见 [需求沟通流程与 HITL](docs/requirement-consultation.md)。
+| 智能体   | 职责                                       | 说明                                         |
+| -------- | ------------------------------------------ | -------------------------------------------- |
+| 需求沟通 | 自然访谈、事实来源、保存与等待客户         | [流程 / 节点 / 模拟](docs/需求沟通智能体.md) |
+| 起草     | 独立规划、选工具、写详细章节、标注补充设计 | [流程 / 节点 / 模拟](docs/起草智能体.md)     |
+| 项目协作 | 读取基线、比较变更、准备工单及其他业务草稿 | [流程 / 节点 / 模拟](docs/项目协作智能体.md) |
+
+整体执行、事务与并发见[执行架构](docs/执行架构.md)；真实测试范围及局部问题见[验收记录](docs/验收记录.md)。
+
+## 产品流程
+
+```mermaid
+flowchart LR
+    A["客户沟通"] --> B["保存业务事实"]
+    B --> C["客户要求起草"]
+    C --> D["详细开发草案"]
+    D --> E["双方评审确认"]
+    E --> F["发布V1"]
+    F --> G["需求变更 / 任务 / 交付 / 售后"]
+    G --> H["人工处理与验收"]
+```
+
+- 客户无需先填写完整项目表或技术栈；只有本轮明确要求才起草，不因“信息齐全”自动生成。
+- 详细稿保留字段、接口、状态、异常、并发、技术、部署与验收；自动建议和客户事实分开。
+- 草案完成不等于实现正确或已发布。待确认问题阻止确认；编辑正文清空双方签名；正式版不可覆盖。
+- 普通用户仅访问本人记录，后台只允许管理员。每个浏览器标签页可以选不同账号。
+- 执行步骤放在每轮聊天中，用户看到实际业务动作和耗时，后台保留模型/工具事件。
+- 顾问回复与起草章节逐步展示；断线继续订阅原任务，完成后显示已保存结果。流式输出不展示工具参数或私有推理，细节见[模型管理](docs/模型管理.md)。
+- PostgreSQL保存权威数据；Redis只做可重建的读取缓存。模型与外部工具期间不持有SQL事务。
 
 ## 本地启动
 
-使用 Conda Python 3.12、Node.js 22.12+、Docker Compose。当前本机环境 `D:\code\env\supportflow`；依赖统一维护根 requirements.txt。
+需要Conda Python 3.12、Node.js 22.12+和Docker Compose。以下命令在仓库根目录执行：
 
 ```powershell
+Set-Location D:\code\python\project
+conda env create --prefix D:\code\env\supportflow --file environment.yml
 conda activate D:\code\env\supportflow
-python -m pip install -r requirements.txt
-# 首次部署复制 .env.example 为 .env，已有环境保留原文件和数据库密码。
+if (!(Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
+```
+
+已有Conda环境无需重复创建，安装更新依赖可运行 `python -m pip install -r requirements.txt`。在本机 `.env` 填写数据库密码、模型API密钥，保留已有环境的密码与签名密钥。
+
+```powershell
 docker compose --env-file .env -f docker/compose.yaml up -d --wait
 python scripts/migrate.py
 python scripts/create_user.py admin --role admin --display-name 管理员
 python scripts/start_api.py
 ```
 
-另一个终端：
+`create_user.py`只在首次需要管理员时执行，密码通过隐藏交互输入（至少12字符）；启动器不自动创建示例账号。其他账号由管理员开通。
+
+另一个终端启动前端：
 
 ```powershell
-cd frontend
+Set-Location D:\code\python\project\frontend
 npm ci
 npm run dev
 ```
 
-- 客户工作台：http://127.0.0.1:5183/#/
-- 负责人工作台：http://127.0.0.1:5183/#/admin
-- 账号管理：#/admin/users；运行状态：#/admin/status。
-- API 文档：http://127.0.0.1:8091/docs
-- PostgreSQL：127.0.0.1:15432，数据库/用户 supportflow，密码保存在被忽略的 .env；账号位于 public.users。
-- Redis：127.0.0.1:16379，只缓存执行快照与后台汇总；配置、权限和故障回源见[缓存说明](docs/cache.md)。
-- 首次使用scripts/create_user.py交互创建管理员，再由管理员开通客户。现有账号保留；启动不会初始化示例账号或项目。
+Compose当前只提供PostgreSQL和Redis；API与前端分别通过上面的本机命令启动，不是Docker全栈部署。
+
+| 服务 / 页面 | 默认地址                                 |
+| ----------- | ---------------------------------------- |
+| 客户工作区  | http://127.0.0.1:5183/#/                 |
+| 管理后台    | http://127.0.0.1:5183/#/admin            |
+| API文档     | http://127.0.0.1:8091/docs               |
+| 存活 / 就绪 | /api/health/live、/api/health/ready      |
+| PostgreSQL  | 127.0.0.1:15432，库和用户默认supportflow |
+| Redis       | 127.0.0.1:16379                          |
+
+前端通过 `/api` 代理到8091；源文件在api/v1下，当前URL没有额外的/v1前缀。配置加载后需重启API生效。存储已初始化后，重启不需要重新迁移或重新创建账号。
 
 ## 模型配置
 
-在被忽略的根 .env 配置 OpenAI 兼容的 Chat Completions 服务，要求支持原生 tool_calls：
+一套阿里兼容端点与密钥，按用途选模型；下列是示例组合，实际权限与额度由云账号决定：
 
 ```dotenv
 SF_AGENT__BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 SF_AGENT__MODEL=qwen-max
-SF_AGENT__API_KEY=在本机填写
-SF_AGENT__CAPACITY=4
-SF_AGENT__TIMEOUT_SECONDS=30
-SF_AGENT__RUN_SECONDS=90
-SF_AGENT__TOKEN_BUDGET=40000
+SF_AGENT__CONSULTATION__MODEL=qwen-plus
+SF_AGENT__DRAFT_PLANNER__MODEL=qwen-plus
+SF_AGENT__DRAFT_WRITER__MODEL=qwen-flash
+SF_AGENT__API_KEY=
 ```
 
-修改后重启 API。密钥不出现在页面、日志或 Git 中。默认每进程4个Agent执行名额；正式项目每轮最多5次模型调用、8次工具调用、3份草稿；独立起草共享8次模型/8次处理工具/64000token/150秒，另允许已有章节的一次本地收尾，并限制上下文与累计模型用量。请求前按UTF-8字节保守预留输入预算并限制输出，响应按总用量或输入/输出之和计量；供应商不返回用量时按预留上限计量，正式项目超额本轮失败且不保存草稿；起草子Agent保留已写章节并标为部分完成。模型/工具期间不持有数据库事务。跨进程以 PostgreSQL 项目行锁和运行记录唯一索引互斥；HTTP请求立即返回执行ID，刷新后可继续查询，不会重复执行。后台任务随API进程运行，崩溃后超过180秒的记录在读取或新请求时标记失败，需人工重新发送；尚无跨进程任务队列。
+用途配置为空时继承通用MODEL；没有API密钥时顾问显示不可用，手动业务仍可使用，不以固定模板冒充模型。详情见[模型管理](docs/模型管理.md)。
 
-## 结构
+## 仓库结构
 
 ```text
 backend/
-  agents/orchestrator.py          单 Agent 决策 / 工具循环与执行预算
-  agents/consultation/graph.py    流程连接与HITL恢复
-  agents/consultation/nodes.py    业务沟通、按需起草决策与人工断点
-  agents/drafting/agent.py       独立起草子Agent与原生工具循环
-  agents/drafting/state.py       每次执行独立的Pydantic状态
-  agents/tools/                  有权限边界的项目工具和公开搜索
-  api/router.py                   总路由
-  api/v1/projects.py              项目、需求、工单、执行记录接口
-  db/session.py                   AsyncEngine → async_sessionmaker → AsyncSession
-  db/project_store.py             项目事务、版本、确认、幂等和执行保存
-  db/cache.py                     异步Redis读取缓存和受控回源
-  db/migrations/versions/0011_*    沟通阶段和累计纪要迁移（保留历史数据）
-  models/projects.py              项目数据与命令校验
-frontend/src/
-  views/ProjectsView.vue           客户/负责人项目工作台
-  components/RequirementDocument.vue  安全文档与流程图预览
-  api/projects.ts                 业务类型
+  agents/
+    runtime.py                 生命周期、执行准入与业务分派
+    common.py                  序列化和预算
+    consultation/              graph / nodes / prompts / state
+    drafting/                  graph / nodes / prompts / state
+    project/                   graph / nodes / prompts / state
+    tools/                     唯一工具目录
+  core/llm/                    用途模型工厂、客户端与配置
+  api/router.py                总路由
+  api/v1/                      薄接口
+  db/                          异步PG、缓存、迁移和检查点
+  models/                      业务、命令和状态校验
+  services/                    鉴权业务
+frontend/                      Vue 3 + TypeScript用户端与后台
+scripts/                       启动、迁移、账号维护
+tests/                         自动验证
+docs/                          当前实现、图示与验收说明
 ```
 
-JWT access/refresh、每标签页账号隔离、短事务、有界HTTP准入、数据库连接池继续沿用。项目所有读取/写入校验本人归属或管理员身份；工单操作使用版本号与请求ID防止覆盖和重复提交。客户先进行业务访谈，提出整理后形成需求草案，补齐问题并经双方确认后立项；后续通过变更和售后记录跟进。
+Python依赖唯一来源为requirements.txt，pyproject.toml与environment.yml复用。旧医学项目在另一个仓库，不属于本项目；旧电商表只为历史数据保留，不代表当前业务。
 
-## 验证
+## 验证与运行边界
 
-本轮浏览器实测、发现的问题、自动检查和审查结果见[需求沟通与起草验收](docs/acceptance.md)。
+修改时先运行受影响检查，通过后不重复整套。具体命令、模拟与实测的区别见[验证指南](docs/验证指南.md)。
 
-改动过程中仅运行相关测试，收尾集中验证一次。PostgreSQL测试使用隔离的临时schema并自行清理，不修改业务数据：
+每进程默认4个后台Agent名额；持久数据与鉴权在PostgreSQL。当前后台任务在API进程内运行，没有持久队列或重启后的自动调度。刷新可恢复查询，需求沟通有HITL，起草支持同次执行的检查点重入，三者的恢复范围不能混为一谈。
 
-```powershell
-$env:SUPPORTFLOW_TEST_POSTGRES="1"
-python -m pytest -q
-python -m ruff check backend scripts tests
-python -m ruff format --check backend scripts tests
-cd frontend
-npm test
-npm run format:check
-npm run build
-```
-
-旧电商运行代码、页面、接口、测试、初始化脚本与重复文档已移除。历史数据库表与迁移链保留，避免破坏已有数据。删除前的70个文件保存在本机忽略提交的 `storage/cleanup-archive/commerce-before-removal-20261025.zip`，不参与运行。客户已有沟通与项目记录未删除。
-
-主沟通将已存纪要和原话交给独立起草子Agent。它通过原生工具自主选择规划、搜索、写章、查看正文或结束，也可直接生成；所有工具共享本次Pydantic状态，失败保留已有内容。详见[Draft Agent流程](docs/draft-agent.md)。
+详细稿中的SQL、配置和设计指标是待评审方案，生成成功不代表实际开发或实测成功。当前没有附件解析、向量RAG、Skill/MCP调用、代码仓库集成和真实外部交付自动化；新增能力按真实需求实现。

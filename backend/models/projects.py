@@ -100,7 +100,7 @@ class ProjectOperation(Base):
     project_id: Mapped[UUID] = mapped_column(ForeignKey("delivery_projects.id"))
     request_id: Mapped[UUID] = mapped_column(Uuid)
     fingerprint: Mapped[str] = mapped_column(String(64))
-    action: Mapped[str] = mapped_column(String(40))
+    action: Mapped[str] = mapped_column(String(64))
     result: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

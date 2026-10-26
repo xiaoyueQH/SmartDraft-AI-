@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from backend.agents.orchestrator import ProjectAgent
+from backend.agents.runtime import AgentRuntime
 from backend.api.admission import RequestAdmissionMiddleware
 from backend.api.errors import register_error_handlers
 from backend.api.router import router as api_router
@@ -29,8 +29,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = resolved_settings
         app.state.request_slots = asyncio.Semaphore(resolved_settings.app.request_capacity)
         passwords = PasswordWork(resolved_settings.auth.password_workers)
-        agent = ProjectAgent(resolved_settings.agent)
-        app.state.project_agent = agent
+        agent = AgentRuntime(resolved_settings.agent)
+        app.state.agent_runtime = agent
         try:
             await passwords.initialize()
             app.state.auth_service = AuthService(
@@ -50,7 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del app.state.database
             del app.state.settings
             del app.state.request_slots
-            del app.state.project_agent
+            del app.state.agent_runtime
             del app.state.read_cache
 
     app = FastAPI(title="SupportFlow API", version="0.1.0", lifespan=lifespan)

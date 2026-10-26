@@ -8,11 +8,15 @@ import pytest
 from sqlalchemy import func, select
 from test_postgresql import postgres, postgres_auth  # noqa: F401
 
+from backend.db.project_admin_store import ProjectAdminStore
 from backend.db.project_store import ProjectStore
 from backend.models.projects import (
+    CreateItem,
+    ItemAction,
     ManageRecords,
     Project,
     ProjectError,
+    ProjectOperation,
     ProjectRecordEvent,
     ProjectRun,
     RecordTarget,
@@ -27,6 +31,133 @@ pytestmark = pytest.mark.skipif(
 
 async def identity(auth, name="alice"):
     return await auth.authenticate((await auth.login(name, "Postgres-test-password")).access_token)
+
+
+async def test_postgres_review_migration_and_full_business_lifecycle(postgres_auth):
+    import importlib
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import text
+
+    auth = postgres_auth
+    await auth.create_user("reviewer", "负责人", "admin", "Postgres-test-password")
+    customer, admin = await identity(auth), await identity(auth, "reviewer")
+    database = auth.store.database
+    store = ProjectStore(database)
+    record = await store.start_consultation(customer, StartConsultation(request_id=uuid4()))
+    pid = UUID(record["id"])
+    item = await store.create_item(
+        customer,
+        pid,
+        CreateItem(
+            request_id=uuid4(),
+            kind="specification",
+            title="会议室需求书",
+            content="员工预约会议室，前台维护空闲时间。",
+            base_revision=0,
+        ),
+    )
+    # Reproduce the deployed pre-migration width and upgrade it with an existing receipt.
+    async with database.engine.begin() as connection:
+
+        def upgrade(sync):
+            schema = sync.get_execution_options()["schema_translate_map"][None]
+            sync.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+            sync.execute(
+                text("ALTER TABLE project_operations ALTER COLUMN action TYPE VARCHAR(40)")
+            )
+            migration = importlib.import_module(
+                "backend.db.migrations.versions.0016_project_operation_action"
+            )
+            with Operations.context(MigrationContext.configure(sync)):
+                migration.upgrade()
+
+        await connection.run_sync(upgrade)
+
+    async def act(who, row, action, **extra):
+        command = ItemAction(
+            request_id=uuid4(), expected_version=row["version"], action=action, **extra
+        )
+        result = await store.act(who, pid, UUID(row["id"]), command)
+        assert await store.act(who, pid, UUID(row["id"]), command) == result
+        return result["item"]
+
+    item = await act(customer, item, "submit")
+    assert item["status"] == "submitted"
+    queue = await ProjectAdminStore(database).items(
+        admin, category="documents", status="pending_review"
+    )
+    assert [entry["id"] for entry in queue["items"]] == [item["id"]]
+    assert (await store.detail(customer, pid))["project"]["revision"] == 0
+    item = await act(customer, item, "confirm")
+    assert item["customer_confirmed"] and not item["staff_confirmed"]
+    item = await act(admin, item, "confirm")
+    assert item["published_revision"] == 1
+    snapshot = await store.detail(customer, pid)
+    assert snapshot["project"]["phase"] == "project" and snapshot["project"]["revision"] == 1
+    change = await store.create_item(
+        customer,
+        pid,
+        CreateItem(
+            request_id=uuid4(),
+            kind="change",
+            title="增加邮件提醒",
+            content=item["content"] + "增加邮件提醒。",
+            base_revision=1,
+        ),
+    )
+    for who, action in ((customer, "submit"), (admin, "confirm"), (customer, "confirm")):
+        change = await act(who, change, action)
+    assert change["published_revision"] == 2
+    assert (await store.item(customer, pid, UUID(item["id"])))["content"] == item["content"]
+    ticket = await store.create_item(
+        customer,
+        pid,
+        CreateItem(
+            request_id=uuid4(),
+            kind="bug",
+            title="邮件未收到",
+            content="预约成功但没有提醒。",
+            base_revision=2,
+        ),
+    )
+    for who, action, note in (
+        (customer, "submit", ""),
+        (admin, "start", ""),
+        (admin, "supplement", "已检查通知配置"),
+        (admin, "deliver", "已修复并提供验证记录"),
+        (customer, "accept", "复测通过"),
+    ):
+        ticket = await act(who, ticket, action, note=note)
+    assert ticket["status"] == "closed"
+    async with database.session() as session:
+        actions = list(
+            await session.scalars(
+                select(ProjectOperation.action).where(ProjectOperation.project_id == pid)
+            )
+        )
+    assert f"submit:{item['id']}" in actions and f"supplement:{ticket['id']}" in actions
+    assert max(map(len, actions)) > 40
+    async with database.session() as session:
+        session.add_all(
+            [
+                ProjectOperation(
+                    actor_id=customer.account.id,
+                    project_id=pid,
+                    request_id=uuid4(),
+                    fingerprint="a" * 64,
+                    action="create_item",
+                    result={"id": str(uuid4())},
+                    created_at=datetime.now(UTC),
+                )
+                for _ in range(65)
+            ]
+        )
+    history = await store.activity(customer, pid, UUID(item["id"]))
+    assert len(history) == 4 and any(entry["action"] == "create_item" for entry in history)
+    with pytest.raises(ProjectError, match="资料不存在"):
+        await store.activity(customer, pid, uuid4())
 
 
 async def test_parallel_project_creation_is_idempotent_and_owner_reads_are_isolated(postgres_auth):

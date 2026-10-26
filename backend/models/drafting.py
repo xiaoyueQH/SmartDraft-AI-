@@ -38,7 +38,11 @@ class DraftPlan(BaseModel):
     sections: list[DraftSection] = Field(min_length=1, max_length=6)
     role_terms: list[str] = Field(default_factory=list, max_length=15)
     pending_questions: list[str] = Field(default_factory=list, max_length=30)
-    assumptions: list[DraftAssumption] = Field(default_factory=list, max_length=20)
+    assumptions: list[DraftAssumption] = Field(
+        default_factory=list,
+        max_length=20,
+        description="仅记录用户未明确选择、由Agent自动补齐的设计建议；不要复制用户已指定的事实或技术选择。",
+    )
     resolved_questions: list[str] = Field(default_factory=list, max_length=30)
 
     @model_validator(mode="after")
@@ -57,4 +61,8 @@ class DraftFinish(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     questions: list[str] = Field(default_factory=list, max_length=40)
     resolved_questions: list[str] = Field(default_factory=list, max_length=30)
-    assumptions: list[DraftAssumption] = Field(default_factory=list, max_length=20)
+    assumptions: list[DraftAssumption] = Field(
+        default_factory=list,
+        max_length=20,
+        description="仅汇总自动生成的实现选择，不得把客户已指定的内容标为自动选择。",
+    )

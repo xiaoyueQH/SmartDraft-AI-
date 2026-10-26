@@ -11,7 +11,7 @@ from test_consultation import install_model, send
 from test_postgresql import postgres, postgres_auth  # noqa: F401
 from test_projects import project
 
-from backend.agents.orchestrator import ProjectAgent
+from backend.agents.runtime import AgentRuntime
 from backend.db.project_store import ProjectStore
 from backend.models.consultation import (
     ConsultationRecord,
@@ -30,7 +30,7 @@ from backend.models.projects import (
 
 
 def test_misplaced_reply_and_sources_are_lifted_without_relaxing_fact_validation():
-    from backend.agents.consultation.validation import verified_patch
+    from backend.agents.consultation.state import verified_patch
 
     row = ConsultationTurn.model_validate(
         {
@@ -51,7 +51,7 @@ def test_misplaced_reply_and_sources_are_lifted_without_relaxing_fact_validation
 
 
 def test_unsourced_unknown_placeholder_does_not_drop_other_facts_or_overwrite_known_stack():
-    from backend.agents.consultation.validation import verified_patch
+    from backend.agents.consultation.state import verified_patch
 
     row = ConsultationTurn.model_validate(
         {
@@ -65,7 +65,7 @@ def test_unsourced_unknown_placeholder_does_not_drop_other_facts_or_overwrite_kn
 
 
 def test_single_fact_protocol_builds_exact_patch_and_keeps_provenance():
-    from backend.agents.consultation.validation import verified_patch
+    from backend.agents.consultation.state import verified_patch
     from backend.models.discovery import merge_discovery
 
     record = ConsultationRecord(
@@ -90,7 +90,7 @@ def test_single_fact_protocol_builds_exact_patch_and_keeps_provenance():
 
 @pytest.mark.parametrize("remove_old", [False, True])
 def test_stack_components_and_scalar_replacement_preserve_each_original_source(remove_old):
-    from backend.agents.consultation.validation import verified_patch
+    from backend.agents.consultation.state import verified_patch
     from backend.models.discovery import merge_discovery
 
     prompt = "改用Java 21和Spring Boot，PostgreSQL数据库，Docker部署，不用原来的Node.js。"
@@ -124,7 +124,7 @@ def test_scalar_removal_without_replacement_is_not_silently_accepted():
 
 
 def test_latest_stack_components_override_valid_history_but_unknown_sources_still_fail():
-    from backend.agents.consultation.validation import verified_patch
+    from backend.agents.consultation.state import verified_patch
 
     prompt = "现在改成Java和PostgreSQL"
     history = [
@@ -148,7 +148,7 @@ async def test_native_fact_protocol_persists_without_reply_or_duplicated_notes(
     auth_api, monkeypatch
 ):
     client, _, _ = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
 
     async def complete(self, messages, **kwargs):
         if "CONSULTATION_REPLY" in messages[0]["content"]:
@@ -183,7 +183,7 @@ async def test_native_fact_protocol_persists_without_reply_or_duplicated_notes(
             ]
         }, {"total_tokens": 100}
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     result = await send(client, identity, p["id"], "手工录单自动扣库存，希望30分钟内完成")
@@ -210,7 +210,7 @@ async def test_resume_reads_repaired_database_notes_instead_of_old_checkpoint(
             seen.append(data["previous"]["business_facts"])
         return await model.respond(messages)
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     await send(client, identity, p["id"], "先讨论登记订单")
@@ -246,7 +246,7 @@ async def test_missing_or_malformed_reply_never_discards_valid_record(auth_api, 
             "total_tokens": 50
         }
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     result = await send(client, identity, p["id"], "我负责销售，她负责发货，手工订单也要扣库存。")
@@ -276,7 +276,7 @@ async def test_reply_failure_still_persists_valid_record_and_shows_partial_resul
         call["function"]["arguments"] = json.dumps(payload)
         return result, usage
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     result = await send(client, identity, p["id"], "我负责登记订单，她负责发货")
@@ -298,8 +298,8 @@ async def test_plain_conversation_preserves_natural_reply_with_one_call(auth_api
             )
         }, {"total_tokens": 50}
 
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     result = await send(client, identity, p["id"], "两个人做生意，先做哪些比较好？")
@@ -363,8 +363,8 @@ async def test_advisor_search_is_optional_and_never_sends_client_text(
         requests.append(query)
         return []
 
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     monkeypatch.setattr(nodes, "search_public", search)
     async with database.session() as session:
         session.add(ToolSetting(name="web_search", enabled=global_enabled, version=1))
@@ -456,7 +456,7 @@ async def test_interruption_after_discussion_commit_preserves_pair(auth_api, mon
             raise asyncio.CancelledError()
         return await model.respond(messages)
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     await send(client, identity, p["id"], "我负责销售，她负责发货")
@@ -479,14 +479,14 @@ async def test_first_model_failure_preserves_raw_message_and_safe_failure_reply(
     auth_api, monkeypatch, cancel
 ):
     client, _, database = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
 
     async def complete(self, messages, **kwargs):
         if cancel:
             raise asyncio.CancelledError()
         raise TimeoutError("private vendor details")
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     result = await send(client, identity, p["id"], "我负责销售，她负责发货")

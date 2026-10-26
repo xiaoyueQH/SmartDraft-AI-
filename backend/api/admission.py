@@ -30,7 +30,20 @@ class RequestAdmissionMiddleware:
             await response(scope, receive, send)
             return
 
+        released = False
+
+        async def send_response(message):
+            nonlocal released
+            if message["type"] == "http.response.start" and any(
+                key.lower() == b"content-type" and value.startswith(b"text/event-stream")
+                for key, value in message.get("headers", [])
+            ):
+                slots.release()
+                released = True
+            await send(message)
+
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, send_response)
         finally:
-            slots.release()
+            if not released:
+                slots.release()

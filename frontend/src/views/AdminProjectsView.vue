@@ -5,6 +5,7 @@ import { auth } from "../auth/session";
 import {
   kindLabels,
   stateLabels,
+  itemStateLabel,
   type Project,
   type ProjectItem,
 } from "../api/projects";
@@ -164,6 +165,7 @@ function search() {
   void load();
 }
 function openRow(row: ManagedProject | ManagedItem) {
+  if (loading.value) return;
   const item = "project_id" in row;
   void router.push({
     path: `/admin/projects/${item ? row.project_id : row.id}`,
@@ -302,8 +304,7 @@ onUnmounted(() => {
               </td>
               <td v-if="'kind' in row">
                 <span
-                  >{{ kindLabels[row.kind] }} ·
-                  {{ stateLabels[row.status] }}</span
+                  >{{ kindLabels[row.kind] }} · {{ itemStateLabel(row) }}</span
                 ><small v-if="['specification', 'change'].includes(row.kind)"
                   >负责人{{ row.staff_confirmed ? "已确认" : "未确认" }} ·
                   客户{{ row.customer_confirmed ? "已确认" : "未确认" }}</small
@@ -318,7 +319,11 @@ onUnmounted(() => {
               </td>
               <td>{{ new Date(row.created_at).toLocaleString("zh-CN") }}</td>
               <td>
-                <button class="text-button" @click="openRow(row)">
+                <button
+                  class="text-button"
+                  :disabled="loading"
+                  @click="openRow(row)"
+                >
                   {{
                     section === "reviews"
                       ? "查看并审核"

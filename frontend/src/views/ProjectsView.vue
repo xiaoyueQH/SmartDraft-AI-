@@ -13,7 +13,8 @@ import { auth, authState } from "../auth/session";
 import { ApiError, type User } from "../auth/client";
 import {
   kindLabels,
-  stateLabels,
+  itemVersionLabel,
+  itemStateLabel,
   type AgentRun,
   type ItemKind,
   type Project,
@@ -104,7 +105,32 @@ const opened = ref<ProjectItem | null>(null),
   editing = ref(false),
   actionNote = ref("");
 const pending = ref<{ path: string; body: string } | null>(null);
+const actionConfirmation = ref<{
+  action: string;
+  label: string;
+  title: string;
+  projectId: string;
+  projectVersion: number;
+  itemId: string;
+  version: number;
+  note: string;
+} | null>(null);
+const cancelActionButton = ref<HTMLButtonElement | null>(null);
+let actionTrigger: HTMLElement | null = null;
+watch(
+  () => [
+    selected.value,
+    detail.value?.project.version,
+    opened.value?.id,
+    opened.value?.version,
+    editing.value,
+  ],
+  () => {
+    actionConfirmation.value = null;
+  },
+);
 let timer: ReturnType<typeof setTimeout> | null = null;
+let streamController: AbortController | null = null;
 let generation = 0,
   disposed = false;
 let consultationTrigger: HTMLElement | null = null,
@@ -141,6 +167,27 @@ const isDocument = computed(
 const isCustomer = computed(
   () => detail.value?.project.owner_id === authState.user?.id,
 );
+const itemNextStep = computed(() => {
+  const item = opened.value;
+  if (!item || !isDocument.value) return "";
+  if (item.status === "approved")
+    return `已发布正式 V${item.published_revision}，本版内容已锁定。后续调整请新建需求变更。`;
+  if (item.status === "rejected")
+    return "负责人已驳回，请根据处理意见整理新的草稿后重新提交。";
+  if (item.status === "withdrawn")
+    return "本次申请已撤回，可整理新的草稿后提交。";
+  if (item.questions.length)
+    return `还有 ${item.questions.length} 项待确认。可先提交评审讨论；补齐后编辑草稿并重新提交，双方才能确认发布。`;
+  if (item.status === "draft")
+    return "下一步：提交评审。提交不会自动确认或立项，客户与负责人需要分别确认本版内容。";
+  const waiting = [
+    !item.customer_confirmed && "客户",
+    !item.staff_confirmed && "负责人",
+  ]
+    .filter(Boolean)
+    .join("与");
+  return `已提交评审，等待${waiting}确认。双方确认后自动发布正式 V${item.base_revision + 1}。修改正文会清除已有确认，并需重新提交。`;
+});
 const running = computed(() => run.value?.status === "running");
 const conversationRuns = computed(() => {
   const entries = new Map(
@@ -173,6 +220,8 @@ function rememberTrigger() {
     : null;
 }
 function stopPoll() {
+  streamController?.abort();
+  streamController = null;
   if (timer) clearTimeout(timer);
   timer = null;
 }
@@ -186,6 +235,11 @@ async function loadProjects(offset = projectOffset.value) {
   hasMoreProjects.value = page.has_more;
   projectOffset.value = offset;
 }
+function syncProjectSummary(project: Project) {
+  projects.value = projects.value.map((row) =>
+    row.id === project.id && row.version <= project.version ? project : row,
+  );
+}
 async function refresh() {
   if (!selected.value) return;
   const current = generation,
@@ -193,6 +247,7 @@ async function refresh() {
   const next = await auth.request<ProjectDetail>(`/api/projects/${id}`);
   if (disposed || current !== generation) return;
   detail.value = next;
+  syncProjectSummary(next.project);
   olderItems.value = [];
   hasMoreItems.value = next.has_more_items;
   const active = next.runs.find((r) => r.status === "running");
@@ -218,6 +273,7 @@ async function selectProject(id: string) {
     if (disposed || current !== generation) return;
     selected.value = id;
     detail.value = next;
+    syncProjectSummary(next.project);
     configured.value = status.configured;
     searchAvailable.value = !!status.tools?.web_search?.enabled;
     webSearch.value =
@@ -248,6 +304,57 @@ async function selectProject(id: string) {
 }
 function schedulePoll(projectId: string, runId: string, current: number) {
   stopPoll();
+  if (typeof auth.stream === "function") {
+    const controller = new AbortController();
+    streamController = controller;
+    void followRun(projectId, runId, current, controller);
+    return;
+  }
+  scheduleFallback(projectId, runId, current);
+}
+async function followRun(
+  projectId: string,
+  runId: string,
+  current: number,
+  controller: AbortController,
+) {
+  let finished = false;
+  try {
+    await auth.stream(
+      `/api/projects/${projectId}/runs/${runId}/stream`,
+      (event, data) => {
+        if (
+          controller.signal.aborted ||
+          disposed ||
+          current !== generation ||
+          event !== "run"
+        )
+          return;
+        const next = data as AgentRun;
+        if (next.id !== runId) return;
+        run.value = next;
+        finished = next.status !== "running";
+      },
+      controller.signal,
+    );
+    if (controller.signal.aborted || disposed || current !== generation) return;
+    if (finished) {
+      const failed = run.value?.status === "failed" ? run.value.answer : "";
+      await refresh();
+      if (!disposed && current === generation && failed) notice.value = failed;
+    } else
+      timer = setTimeout(() => schedulePoll(projectId, runId, current), 250);
+  } catch (error) {
+    if (controller.signal.aborted || disposed || current !== generation) return;
+    if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
+      run.value = null;
+      notice.value = errorText(error);
+      return;
+    }
+    scheduleFallback(projectId, runId, current);
+  }
+}
+function scheduleFallback(projectId: string, runId: string, current: number) {
   timer = setTimeout(async () => {
     try {
       const next = await auth.request<AgentRun>(
@@ -263,7 +370,7 @@ function schedulePoll(projectId: string, runId: string, current: number) {
     } catch (error) {
       if (!disposed && current === generation) {
         notice.value = errorText(error);
-        schedulePoll(projectId, runId, current);
+        scheduleFallback(projectId, runId, current);
       }
     }
   }, 1500);
@@ -312,8 +419,12 @@ async function retry() {
       closeConsultation();
       await openCreatedConsultation(result as unknown as Project);
     } else {
-      closeItem();
-      await refresh();
+      if (original.endsWith("/actions") && opened.value && !editing.value)
+        await applyItemAction(result);
+      else {
+        closeItem();
+        await refresh();
+      }
     }
   } finally {
     starting.value = false;
@@ -458,6 +569,8 @@ function openNewItem() {
   itemDialog.value?.showModal();
 }
 async function openItem(item: ProjectItem) {
+  const current = generation,
+    projectId = selected.value;
   comparison.value = null;
   itemTrigger = rememberTrigger();
   opened.value = item;
@@ -473,12 +586,15 @@ async function openItem(item: ProjectItem) {
   itemHistory.value = [];
   try {
     const history = await auth.request<typeof itemHistory.value>(
-      `/api/projects/${selected.value}/activity`,
+      `/api/projects/${projectId}/activity?item_id=${item.id}`,
     );
-    if (!disposed && opened.value?.id === item.id)
-      itemHistory.value = history.filter(
-        (event) => event.action.endsWith(`:${item.id}`) && event.note,
-      );
+    if (
+      !disposed &&
+      current === generation &&
+      selected.value === projectId &&
+      opened.value?.id === item.id
+    )
+      itemHistory.value = history;
   } catch {
     /* The record stays readable if its activity cannot be loaded. */
   }
@@ -541,6 +657,25 @@ function recordLabel(row: Project) {
       });
   return `${row.title} · ${stamp} · ${row.id.slice(-6)}`;
 }
+function operationLabel(action: string) {
+  return (
+    (
+      {
+        create_item: "创建记录",
+        submit: "提交评审 / 受理",
+        confirm: "确认本版内容",
+        edit: "编辑草稿",
+        reject: "驳回",
+        withdraw: "撤回",
+        start: "开始处理",
+        deliver: "提交处理结果",
+        accept: "客户验收通过",
+        reopen: "退回继续处理",
+        supplement: "补充说明",
+      } as Record<string, string>
+    )[action.split(":")[0]] || "保存记录"
+  );
+}
 async function saveItem() {
   if (!detail.value) return;
   const content = {
@@ -574,27 +709,105 @@ async function saveItem() {
   }
 }
 async function action(value: string) {
-  if (!opened.value) return;
-  if (
-    ["confirm", "accept", "reject", "withdraw"].includes(value) &&
-    !window.confirm(
-      `确认对「${opened.value.title}」执行「${({ confirm: "确认本版内容", accept: "验收通过并关闭", reject: "驳回", withdraw: "撤回" } as Record<string, string>)[value]}」？`,
-    )
-  )
+  if (!opened.value || saving.value || pending.value) return;
+  const label = (
+    {
+      confirm: "确认本版内容",
+      accept: "验收通过并关闭",
+      reject: "驳回",
+      withdraw: "撤回",
+    } as Record<string, string>
+  )[value];
+  if (label) {
+    actionTrigger = rememberTrigger();
+    actionConfirmation.value = {
+      action: value,
+      label,
+      title: opened.value.title,
+      projectId: selected.value,
+      projectVersion: detail.value!.project.version,
+      itemId: opened.value.id,
+      version: opened.value.version,
+      note: actionNote.value,
+    };
+    await nextTick();
+    cancelActionButton.value?.focus();
     return;
+  }
+  await performAction(value, opened.value.version, actionNote.value);
+}
+async function cancelAction() {
+  actionConfirmation.value = null;
+  await nextTick();
+  actionTrigger?.focus();
+}
+async function confirmAction() {
+  const confirmation = actionConfirmation.value;
+  if (!confirmation || saving.value || pending.value) return;
+  actionConfirmation.value = null;
+  if (
+    confirmation.projectId !== selected.value ||
+    confirmation.projectVersion !== detail.value?.project.version ||
+    confirmation.itemId !== opened.value?.id ||
+    confirmation.version !== opened.value.version
+  ) {
+    notice.value = "记录已更新，请重新查看后再操作";
+    return;
+  }
+  await performAction(
+    confirmation.action,
+    confirmation.version,
+    confirmation.note,
+  );
+}
+async function performAction(value: string, version: number, note: string) {
+  if (!opened.value) return;
   const result = await write(
     `/api/projects/${selected.value}/items/${opened.value.id}/actions`,
     {
       request_id: crypto.randomUUID(),
-      expected_version: opened.value.version,
+      expected_version: version,
       action: value,
-      note: actionNote.value,
+      note,
     },
   );
   if (result) {
-    closeItem();
-    olderItems.value = [];
+    await applyItemAction(result);
+  }
+}
+async function applyItemAction(result: Record<string, unknown>) {
+  const current = generation,
+    projectId = selected.value;
+  const item = result.item as ProjectItem;
+  if (item && opened.value?.id === item.id) {
+    opened.value = item;
+    actionNote.value = "";
+    comparison.value = null;
+    Object.assign(itemForm, {
+      title: item.title,
+      content: item.content,
+      questions: item.questions.join("\n"),
+    });
+  }
+  try {
     await refresh();
+    if (disposed || current !== generation || selected.value !== projectId)
+      return;
+    if (item && opened.value?.id === item.id) {
+      const history = await auth.request<typeof itemHistory.value>(
+        `/api/projects/${projectId}/activity?item_id=${item.id}`,
+      );
+      if (
+        !disposed &&
+        current === generation &&
+        selected.value === projectId &&
+        opened.value?.id === item.id
+      )
+        itemHistory.value = history;
+    }
+  } catch (error) {
+    if (!disposed && current === generation && selected.value === projectId)
+      notice.value = `操作已保存，页面资料暂未同步：${errorText(error)}`;
   }
 }
 async function send(
@@ -657,7 +870,7 @@ async function loadActivity() {
 function download(item: ProjectItem) {
   const blob = new Blob(
     [
-      `# ${item.title}\n\n基于版本：${item.base_revision} · 状态：${stateLabels[item.status]}\n\n${item.content}\n\n## 待确认\n${item.questions.map((q) => `- ${q}`).join("\n")}`,
+      `# ${item.title}\n\n${itemVersionLabel(item)} · 状态：${itemStateLabel(item)}\n\n${item.content}\n\n## 待确认\n${item.questions.map((q) => `- ${q}`).join("\n")}`,
     ],
     { type: "text/markdown;charset=utf-8" },
   );
@@ -1110,21 +1323,21 @@ onUnmounted(() => {
             <div>
               <span>{{ kindLabels[item.kind] }}</span
               ><span class="project-state" :class="item.status">{{
-                stateLabels[item.status]
+                itemStateLabel(item)
               }}</span>
             </div>
             <h3>{{ item.title }}</h3>
             <p>{{ item.content.slice(0, 140) }}</p>
             <footer>
               <span
-                >{{
-                  item.published_revision
-                    ? `发布 V${item.published_revision}`
-                    : `基于 V${item.base_revision}`
-                }}
-                · {{ item.questions.length }} 个待确认</span
+                >{{ itemVersionLabel(item) }} ·
+                {{ item.questions.length }} 个待确认</span
               ><span>查看与处理</span>
             </footer>
+            <small
+              >记录 {{ item.id.slice(-8) }} ·
+              {{ new Date(item.created_at).toLocaleString("zh-CN") }}</small
+            >
           </button>
         </div>
         <p v-if="!visibleItems.length" class="project-muted">
@@ -1193,8 +1406,8 @@ onUnmounted(() => {
           <p class="record-caption">项目记录</p>
           <h2>{{ opened?.title || "新建记录" }}</h2>
           <p v-if="opened">
-            {{ kindLabels[opened.kind] }} · {{ stateLabels[opened.status] }} ·
-            基于 V{{ opened.base_revision }}
+            {{ kindLabels[opened.kind] }} · {{ itemStateLabel(opened) }} ·
+            {{ itemVersionLabel(opened) }}
           </p>
         </div>
         <button
@@ -1261,6 +1474,41 @@ onUnmounted(() => {
           取消编辑
         </button>
       </form>
+      <section
+        v-else-if="opened && actionConfirmation"
+        class="project-confirmation"
+        role="group"
+        aria-label="操作确认"
+      >
+        <h3>操作确认</h3>
+        <p>
+          将对「{{ actionConfirmation.title }}」执行「{{
+            actionConfirmation.label
+          }}」。
+        </p>
+        <p v-if="actionConfirmation.note">
+          处理说明：{{ actionConfirmation.note }}
+        </p>
+        <p v-if="actionConfirmation.action === 'confirm'">
+          确认表示您已审阅本版内容；双方确认后将发布正式版本。
+        </p>
+        <div class="project-actions">
+          <button
+            ref="cancelActionButton"
+            class="button button-outline"
+            @click="cancelAction"
+          >
+            取消操作
+          </button>
+          <button
+            class="button button-dark"
+            :disabled="saving || !!pending"
+            @click="confirmAction"
+          >
+            确定执行
+          </button>
+        </div>
+      </section>
       <template v-else-if="opened"
         ><div class="project-actions">
           <button class="button button-outline" @click="download(opened)">
@@ -1281,7 +1529,7 @@ onUnmounted(() => {
             :disabled="saving || !!pending"
             @click="action('submit')"
           >
-            提交评审 / 受理</button
+            {{ isDocument ? "提交评审" : "提交受理" }}</button
           ><button
             v-if="
               isDocument &&
@@ -1335,9 +1583,7 @@ onUnmounted(() => {
         <p v-if="isDocument" class="project-confirmation">
           客户：{{ opened.customer_confirmed ? "已确认" : "待确认" }} ·
           负责人：{{ opened.staff_confirmed ? "已确认" : "待确认" }}<br />{{
-            discovery
-              ? "补齐待确认事项，并经客户与负责人分别确认后，才会建立正式项目。"
-              : "修改草稿会清除双方确认；已发布版本保留原文。"
+            itemNextStep
           }}
         </p>
         <ul v-if="opened.questions.length" class="project-questions">
@@ -1412,7 +1658,13 @@ onUnmounted(() => {
         </button>
         <div v-if="comparison" class="requirement-comparison">
           <section>
-            <h3>原基线 V{{ comparison.base_revision }}</h3>
+            <h3>
+              {{
+                comparison.base_revision
+                  ? `原基线 V${comparison.base_revision}`
+                  : "尚无正式基线"
+              }}
+            </h3>
             <pre>{{ comparison.before || "尚无已确认基线" }}</pre>
           </section>
           <section>
@@ -1428,12 +1680,17 @@ onUnmounted(() => {
         </div>
         <RequirementDocument :content="opened.content" />
         <details v-if="itemHistory.length" class="item-history">
-          <summary>沟通与处理历史（{{ itemHistory.length }}）</summary>
+          <summary>
+            本记录最近 60 条处理历史（{{ itemHistory.length }}）
+          </summary>
           <article v-for="event in itemHistory" :key="event.id">
             <small>{{
               new Date(event.created_at).toLocaleString("zh-CN")
             }}</small>
-            <p>{{ event.note }}</p>
+            <p>
+              {{ operationLabel(event.action)
+              }}{{ event.note ? `：${event.note}` : "" }}
+            </p>
           </article>
         </details>
       </template>

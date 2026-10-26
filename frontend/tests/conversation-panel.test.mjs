@@ -369,3 +369,81 @@ test("execution details use business labels and hide internal terminology", asyn
     view.close();
   }
 });
+
+test("live text is shown before saving and replaced by one stored reply on completion", async () => {
+  const run = agentRun("run-live", {
+    preview: { text: "先从预约登记", kind: "reply", title: "" },
+  });
+  const view = mount({ runs: [run] });
+  try {
+    await settle();
+    assert.equal(
+      view.root.querySelector(".chat-stream-text").textContent,
+      "先从预约登记",
+    );
+    assert.match(view.root.textContent, /内容尚在整理/);
+    view.state.runs = [
+      { ...run, preview: { ...run.preview, text: "先从预约登记开始。" } },
+    ];
+    await settle();
+    assert.equal(
+      view.root.querySelector(".chat-stream-text").textContent,
+      "先从预约登记开始。",
+    );
+    view.state.runs = [
+      {
+        ...run,
+        status: "completed",
+        answer: "先从预约登记开始。",
+        preview: null,
+      },
+    ];
+    view.state.messages = [
+      { id: "user", run_id: run.id, role: "user", content: run.prompt },
+      {
+        id: "assistant",
+        run_id: run.id,
+        role: "assistant",
+        content: "先从预约登记开始。",
+      },
+    ];
+    await settle();
+    assert.equal(view.root.querySelector(".chat-stream-text"), null);
+    assert.equal(
+      view.root.querySelectorAll(".project-message.assistant").length,
+      1,
+    );
+    assert.equal(
+      view.root.textContent.split("先从预约登记开始。").length - 1,
+      1,
+    );
+  } finally {
+    view.close();
+  }
+});
+
+test("unfinished chapter preview stays plain text and never executes HTML", async () => {
+  const view = mount({
+    runs: [
+      agentRun("chapter", {
+        preview: {
+          kind: "document",
+          title: "角色与权限",
+          text: '<img src=x onerror="alert(1)">\n## 客户',
+        },
+      }),
+    ],
+  });
+  try {
+    await settle();
+    assert.match(view.root.textContent, /正在撰写：角色与权限/);
+    assert.equal(view.root.querySelector(".chat-live-preview img"), null);
+    view.state.runs = [
+      { ...view.state.runs[0], status: "failed", answer: "本轮暂未完成" },
+    ];
+    await settle();
+    assert.equal(view.root.querySelector(".chat-live-preview"), null);
+  } finally {
+    view.close();
+  }
+});

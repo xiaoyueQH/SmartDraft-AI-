@@ -6,8 +6,8 @@ import pytest
 from sqlalchemy import func, select
 from test_auth import auth_api, headers, login  # noqa: F401
 
-from backend.agents.limits import measured_tokens, request_budget
-from backend.agents.orchestrator import ProjectAgent
+from backend.agents.common import measured_tokens, request_budget
+from backend.agents.runtime import AgentRuntime
 from backend.models.discovery import merge_discovery
 from backend.models.projects import ProjectError, ProjectItem, ProjectMessage, ProjectRun
 
@@ -242,7 +242,7 @@ async def wait_run(client, identity, pid, rid):
 
 async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_api, monkeypatch):
     client, _, database = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
     calls = []
 
     async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
@@ -274,7 +274,7 @@ async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_
         assert messages[-1]["role"] == "tool" and "private" not in str(messages)
         return {"content": "已准备需求草稿，请确认是否需要审核。"}, {"total_tokens": 80}
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     customer = headers(await login(client))
     p = await project(client, customer)
     await baseline(client, customer, headers(await login(client, "admin")), p["id"])
@@ -297,12 +297,12 @@ async def test_agent_native_tools_persist_drafts_pair_and_trace_atomically(auth_
 
 async def test_agent_failure_preserves_raw_discussion_without_invented_facts(auth_api, monkeypatch):
     client, _, database = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
 
     async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
         raise TimeoutError("provider timeout secret details must never be exposed")
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     customer = headers(await login(client))
     p = await project(client, customer)
     response = await client.post(
@@ -321,7 +321,7 @@ async def test_chat_reloads_each_turn_trace_even_with_repeated_text(auth_api, mo
     import json
 
     client, _, _ = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
 
     async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
         from test_consultation import extracted
@@ -329,7 +329,7 @@ async def test_chat_reloads_each_turn_trace_even_with_repeated_text(auth_api, mo
         data = json.loads(messages[1]["content"].split("以下为业务数据：", 1)[1])
         return extracted(data["input"])
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     customer = headers(await login(client))
     p = await project(client, customer)
     run_ids = []
@@ -366,7 +366,7 @@ async def test_discovery_remembers_business_across_turns_without_auto_creating_p
     import json
 
     client, _, _ = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
     calls = 0
 
     async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
@@ -395,7 +395,7 @@ async def test_discovery_remembers_business_across_turns_without_auto_creating_p
         )
         return extracted(data["input"], notes)
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     customer = headers(await login(client))
     p = await project(client, customer)
     for content in (
@@ -421,7 +421,7 @@ async def test_failed_turn_does_not_commit_prepared_discovery_notes(auth_api, mo
     import json
 
     client, _, _ = auth_api
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
     calls = 0
 
     async def complete(self, messages, *, allow_tools, max_output_tokens=4000, **kwargs):
@@ -444,7 +444,7 @@ async def test_failed_turn_does_not_commit_prepared_discovery_notes(auth_api, mo
             )
         raise TimeoutError("provider interrupted")
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     from backend.db.project_store import ProjectStore
 
     async def reject_commit(self, *args, **kwargs):

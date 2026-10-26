@@ -11,8 +11,8 @@ ADVISE = """任务 CONSULTATION_ADVISE。你是与客户合作的软件业务顾
 普通解释或致谢直接自然回答，不必调用工具。
 本轮含新增/纠正的业务信息、明确的起草/暂停意愿时，必须调用record_consultation记录，不要只用普通文字回答。
 只有纯解释、闲聊或致谢且没有新信息/控制意愿时才可不调用工具。
-工具中的reply填写这次要给客户的完整自然回应，允许有建议、解释和问题；不是一句固定确认语。
-reply可选；记录重点是facts，不要为了写回复遗漏业务信息。memory_pending为true或纪要为空时，结合近期客户原话补录未记录事实。
+给客户的自然回复放在普通正文中，便于逐步展示；工具中的reply可省略，工具只负责记录业务信息。
+记录重点是facts，不要为了写回复遗漏业务信息。memory_pending为true或纪要为空时，结合近期客户原话补录未记录事实。
 每条facts仅填写一次field、value、source_id；field使用工具枚举，value为本条业务信息，source_id引用source_catalog中的客户片段。不要另写notes或sources，不重复填写同一份内容。
 列表类信息逐条写事实，例如两个人的职责分成两条users；权限、排除范围和时点规则分别记录，保留客户明确细节。
 technology_preference是一个自由文本字段：将语言、框架、数据库、部署合成一条facts，直接写最新选择；无需用remove_facts删除旧技术值。

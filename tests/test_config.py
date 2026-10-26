@@ -25,6 +25,18 @@ def test_unknown_nested_setting_is_rejected(monkeypatch):
         Settings(_env_file=None)
 
 
+def test_model_profiles_are_independently_configurable_and_validated(monkeypatch):
+    monkeypatch.setenv("SF_AGENT__DRAFT_WRITER__MODEL", "writer-snapshot")
+    monkeypatch.setenv("SF_AGENT__DRAFT_WRITER__CONCURRENCY", "3")
+    settings = Settings(_env_file=None)
+    assert settings.agent.draft_writer.model == "writer-snapshot"
+    assert settings.agent.draft_writer.concurrency == 3
+    assert settings.agent.consultation.model == ""
+    monkeypatch.setenv("SF_AGENT__DRAFT_WRITER__CONCURRENCY", "0")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 def test_credentials_are_masked_and_url_preserves_special_characters(monkeypatch):
     password = "local-secret@:/?#"
     monkeypatch.setenv("SF_DATABASE__PASSWORD", password)

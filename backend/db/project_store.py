@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from backend.db.identity import lock_identity
 from backend.db.session import Database
@@ -917,17 +917,33 @@ class ProjectStore:
                 row.status = "completed"
                 row.cache_version += 1
 
-    async def activity(self, principal, project_id):
+    async def activity(self, principal, project_id, item_id=None):
         async with self.database.session() as session:
             await self._project(session, principal, project_id)
-            rows = await session.scalars(
-                select(ProjectOperation)
-                .where(
-                    ProjectOperation.project_id == project_id,
-                    ~ProjectOperation.action.startswith("records:"),
+            statement = select(ProjectOperation).where(
+                ProjectOperation.project_id == project_id,
+                ~ProjectOperation.action.startswith("records:"),
+            )
+            if item_id is not None:
+                if not await session.scalar(
+                    select(ProjectItem.id).where(
+                        ProjectItem.id == item_id, ProjectItem.project_id == project_id
+                    )
+                ):
+                    raise ProjectError("ITEM_NOT_FOUND", "资料不存在", 404)
+                statement = statement.where(
+                    or_(
+                        ProjectOperation.action.endswith(f":{item_id}"),
+                        and_(
+                            ProjectOperation.action == "create_item",
+                            ProjectOperation.result["id"].as_string() == str(item_id),
+                        ),
+                    )
                 )
-                .order_by(ProjectOperation.created_at.desc(), ProjectOperation.id)
-                .limit(60)
+            rows = await session.scalars(
+                statement.order_by(ProjectOperation.created_at.desc(), ProjectOperation.id).limit(
+                    60
+                )
             )
             result = [
                 {
@@ -939,6 +955,8 @@ class ProjectStore:
                 }
                 for row in rows
             ]
+            if item_id is not None:
+                return result
             events = await session.scalars(
                 select(ProjectRecordEvent)
                 .where(ProjectRecordEvent.project_id == project_id)

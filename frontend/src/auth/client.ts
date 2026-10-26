@@ -114,13 +114,14 @@ export class SessionClient {
     sid: string | null,
     token: string | null,
     useCurrentSignal = true,
+    streaming = false,
   ) {
     const headers = new Headers(init.headers);
     if (sid) headers.set("X-Session-ID", sid);
     if (token) headers.set("Authorization", `Bearer ${token}`);
     if (init.body && !headers.has("Content-Type"))
       headers.set("Content-Type", "application/json");
-    const signals = [AbortSignal.timeout(10000)];
+    const signals = [AbortSignal.timeout(streaming ? 35000 : 10000)];
     if (useCurrentSignal) signals.push(this.controller.signal);
     if (init.signal) signals.push(init.signal);
     return this.fetcher(path, {
@@ -264,7 +265,11 @@ export class SessionClient {
     return this.refresh();
   }
 
-  async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  async request<T>(
+    path: string,
+    init: RequestInit = {},
+    onFrame?: (event: string, data: unknown) => void,
+  ): Promise<T> {
     if (!path.startsWith("/api/")) throw new ApiError("不允许的接口地址");
     const startingSid = this.sessionId,
       startingVersion = this.version,
@@ -287,6 +292,8 @@ export class SessionClient {
         init,
         this.sessionId,
         this.accessToken,
+        true,
+        Boolean(onFrame),
       );
       if (response.status === 401) {
         const errorBody = await response.clone().json();
@@ -299,11 +306,27 @@ export class SessionClient {
             init,
             this.sessionId,
             this.accessToken,
+            true,
+            Boolean(onFrame),
           );
         }
       }
+      if (onFrame && response.ok) {
+        await this.readStream(response, version, onFrame);
+        return undefined as T;
+      }
       return await this.read<T>(response, version);
     } catch (error) {
+      if (
+        onFrame &&
+        version === this.version &&
+        error instanceof ApiError &&
+        error.code === "ACCESS_EXPIRED"
+      ) {
+        await this.refresh();
+        this.assertCurrent(version);
+        return undefined as T;
+      }
       if (
         version === this.version &&
         error instanceof ApiError &&
@@ -314,6 +337,78 @@ export class SessionClient {
         if (sid) this.publish(sid);
       }
       throw error;
+    }
+  }
+
+  async stream(
+    path: string,
+    onFrame: (event: string, data: unknown) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.request<void>(
+      path,
+      { signal, headers: { Accept: "text/event-stream" } },
+      onFrame,
+    );
+  }
+
+  private async readStream(
+    response: Response,
+    version: number,
+    onFrame: (event: string, data: unknown) => void,
+  ) {
+    this.assertCurrent(version);
+    const sid = response.headers.get("X-Auth-Session");
+    if (sid && sid !== this.sessionId)
+      throw new ApiError("账号会话不匹配", 401, "SESSION_INVALID");
+    if (
+      !response.headers.get("Content-Type")?.startsWith("text/event-stream") ||
+      !response.body
+    )
+      throw new ApiError("实时连接暂不可用");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "",
+      event = "message",
+      data: string[] = [],
+      size = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        this.assertCurrent(version);
+        if (done) return;
+        pending += decoder.decode(value, { stream: true });
+        if (pending.length + size > 524288)
+          throw new ApiError("实时响应过大，请重新连接");
+        let newline;
+        while ((newline = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, newline).replace(/\r$/, "");
+          pending = pending.slice(newline + 1);
+          if (!line) {
+            if (data.length) {
+              this.assertCurrent(version);
+              const parsed = JSON.parse(data.join("\n"));
+              if (event === "error")
+                throw new ApiError(
+                  parsed.message || "实时连接中断",
+                  parsed.status || 503,
+                  parsed.code,
+                );
+              onFrame(event, parsed);
+            }
+            event = "message";
+            data = [];
+            size = 0;
+          } else if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) {
+            data.push(line.slice(5).trimStart());
+            size += line.length;
+          }
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
   }
 

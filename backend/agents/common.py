@@ -1,12 +1,17 @@
-from backend.agents.tools.registry import TOOLS, tool_json
+import json
+
 from backend.models.projects import ProjectError
+
+
+def tool_json(value):
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def request_budget(messages, allow_tools, remaining, *, tools=None, max_output=4000):
     # UTF-8 bytes deliberately overestimate byte-tokenized input, including tool schemas.
     request = {
         "messages": messages,
-        "tools": (TOOLS if tools is None else tools) if allow_tools else [],
+        "tools": (tools or []) if allow_tools else [],
     }
     input_reserve = len(tool_json(request).encode("utf-8")) + 1024
     output_allowance = min(max_output, remaining - input_reserve)

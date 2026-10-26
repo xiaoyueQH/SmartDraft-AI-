@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from backend.agents.drafting.service import label_proposals, pending_questions, saved_notes
+from backend.agents.drafting.graph import label_proposals, pending_questions, saved_notes
 
 
 def test_exact_saved_rules_and_exclusions_are_retained_without_model_rewrite():
@@ -32,3 +32,9 @@ def test_generated_details_cannot_label_themselves_as_confirmed_customer_facts()
     assert "### 输入字段" in body
     assert "【已说明】" not in body
     assert pending_questions(body, {}, SimpleNamespace(conflicts=[])) == ["接入条件未知"]
+
+
+def test_legacy_suggestions_are_marked_automatic_without_turning_them_into_questions():
+    body = label_proposals("## 实施建议\n【建议，待确认】使用关系数据库。\n## 待确认事项\n暂无")
+    assert "【自动生成】使用关系数据库。" in body
+    assert pending_questions(body, {}, SimpleNamespace(conflicts=[])) == []

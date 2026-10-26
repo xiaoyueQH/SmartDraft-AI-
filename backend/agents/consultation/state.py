@@ -1,4 +1,11 @@
+from typing import TypedDict
+
 from backend.models.projects import DiscoveryNotes
+
+
+class GraphState(TypedDict):
+    route: str
+    payload: dict
 
 
 def source_catalog(prompt, run_id, history=()):

@@ -8,7 +8,7 @@ from test_consultation import install_model, send
 from test_projects import project
 
 from backend.agents.consultation.nodes import is_draft_command
-from backend.agents.orchestrator import ProjectAgent
+from backend.agents.runtime import AgentRuntime
 from backend.db.project_store import ProjectStore
 from backend.models.projects import ProjectError
 
@@ -51,7 +51,7 @@ async def test_writer_uses_saved_notes_and_never_reextracts_or_asks_for_document
             assert kwargs.get("tools") and not kwargs.get("json_output")
         return await model.respond(messages)
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     await send(client, identity, p["id"], "先记录业务信息：手工登记和查询预约。")
@@ -63,6 +63,7 @@ async def test_writer_uses_saved_notes_and_never_reextracts_or_asks_for_document
     detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
     assert len(detail["items"]) == 1 and "客户已说明的信息" in detail["items"][0]["content"]
     assert "登记和查询预约" in detail["items"][0]["content"]
+    assert "用户未明确选择的设计属于【自动生成】方案" in detail["items"][0]["content"]
     assert detail["project"]["revision"] == 0 and detail["items"][0]["questions"]
 
 
@@ -148,7 +149,7 @@ async def test_section_draft_commits_once_and_keeps_human_review(
             return {"content": "【已说明】前台负责预约登记。\n" * 15}, {"total_tokens": 100}
         return await model.respond(messages)
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
     identity = headers(await login(client))
     p = await project(client, identity)
     await send(client, identity, p["id"], "预约登记、查询并校验冲突时间")

@@ -76,6 +76,7 @@ export interface AgentRun {
   created_at: string;
   events: AgentEvent[];
   options?: { web_search?: boolean };
+  preview?: { text: string; kind: "reply" | "document"; title: string } | null;
 }
 export interface ProjectMessage {
   id: string;
@@ -110,3 +111,18 @@ export const stateLabels: Record<string, string> = {
   awaiting_acceptance: "待客户验收",
   closed: "已关闭",
 };
+
+export function itemVersionLabel(item: ProjectItem): string {
+  if (item.published_revision) return `正式 V${item.published_revision}`;
+  return item.base_revision
+    ? `基于正式 V${item.base_revision}`
+    : "初始需求 · 尚未发布";
+}
+
+export function itemStateLabel(item: ProjectItem): string {
+  if (item.status === "submitted")
+    return ["specification", "change"].includes(item.kind)
+      ? "待双方评审"
+      : "待受理";
+  return stateLabels[item.status] || item.status;
+}

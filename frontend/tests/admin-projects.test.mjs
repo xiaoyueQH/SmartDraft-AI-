@@ -121,6 +121,38 @@ test("review queue opens the exact project document and can change to the servic
   }
 });
 
+test("rows from the previous queue cannot be opened while the next queue is loading", async () => {
+  let resolve;
+  const delayed = new Promise((done) => {
+    resolve = done;
+  });
+  const view = mount(
+    async (path) => {
+      if (path.includes("category=service")) return delayed;
+      return {
+        items: [
+          { ...row, project_id: row.id, kind: "change", status: "submitted" },
+        ],
+      };
+    },
+    { section: "reviews" },
+  );
+  try {
+    await settle();
+    view.state.section = "service";
+    await settle();
+    const stale = button(view.root, "查看并处理");
+    assert.ok(stale.disabled);
+    stale.click();
+    assert.equal(view.pushed.length, 0);
+    resolve({ items: [] });
+    await settle();
+    assert.equal(button(view.root, "查看并处理"), undefined);
+  } finally {
+    view.close();
+  }
+});
+
 test("project management applies customer search and the phase selected from overview", async () => {
   const calls = [];
   const view = mount(

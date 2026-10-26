@@ -99,7 +99,10 @@ watch(
   () => [
     props.messages,
     props.runs
-      .map((run) => `${run.id}:${run.status}:${run.events.length}`)
+      .map(
+        (run) =>
+          `${run.id}:${run.status}:${run.events.length}:${run.preview?.text.length || 0}`,
+      )
       .join("|"),
     props.outgoing,
     props.sending,
@@ -151,6 +154,21 @@ function keydown(event: KeyboardEvent) {
         <p v-if="entry.role === 'user'">{{ entry.content }}</p>
         <template v-else
           ><AgentTrace v-if="entry.run" :run="entry.run" />
+          <section
+            v-if="entry.run?.status === 'running' && entry.run.preview?.text"
+            class="chat-live-preview"
+            aria-label="正在生成的内容"
+          >
+            <p class="project-muted" role="status">
+              {{
+                entry.run.preview.kind === "document"
+                  ? `正在撰写：${entry.run.preview.title || "需求草案"}`
+                  : "正在回复…"
+              }}
+              · 内容尚在整理
+            </p>
+            <pre class="chat-stream-text">{{ entry.run.preview.text }}</pre>
+          </section>
           <p
             v-if="entry.run?.status === 'failed'"
             class="chat-error"
@@ -225,3 +243,13 @@ function keydown(event: KeyboardEvent) {
     </form>
   </div>
 </template>
+
+<style scoped>
+.chat-stream-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  line-height: 1.75;
+  margin: 0.6rem 0;
+}
+</style>

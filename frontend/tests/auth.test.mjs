@@ -297,3 +297,106 @@ test("account chooser waits for logout commit and only then notifies sibling tab
   assert.deepEqual(await chooser, []);
   assert.deepEqual(published, [A]);
 });
+
+// The stream uses this tab's headers, including when several accounts share a browser.
+test("stream decodes fragmented UTF-8 frames before the response ends", async () => {
+  let source;
+  let requestHeaders;
+  const client = createClient(storage(), async (url, init) => {
+    if (url.endsWith("/login")) return response(tokens("alice", A));
+    requestHeaders = init.headers;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          source = controller;
+        },
+      }),
+      {
+        headers: { "Content-Type": "text/event-stream", "X-Auth-Session": A },
+      },
+    );
+  });
+  await client.login("alice", "password");
+  const frames = [];
+  const operation = client.stream(
+    "/api/projects/one/runs/run/stream",
+    (event, value) => frames.push([event, value]),
+    new AbortController().signal,
+  );
+  while (!source) await new Promise((resolve) => setImmediate(resolve));
+  const packet = new TextEncoder().encode(
+    'event: run\r\ndata: {"text":"正在回复"}\r\n\r\n',
+  );
+  for (const byte of packet) source.enqueue(Uint8Array.of(byte));
+  while (!frames.length) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(frames, [["run", { text: "正在回复" }]]);
+  assert.equal(requestHeaders.get("Authorization"), "Bearer alice");
+  assert.equal(requestHeaders.get("X-Session-ID"), A);
+  source.close();
+  await operation;
+});
+
+test("a late stream frame from the old account is discarded after switching", async () => {
+  let source;
+  const client = createClient(storage(), async (url, init) => {
+    if (url.endsWith("/login"))
+      return response(
+        JSON.parse(init.body).username === "alice"
+          ? tokens("alice", A)
+          : tokens("bob", B),
+      );
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          source = controller;
+        },
+      }),
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+  });
+  await client.login("alice", "password");
+  const frames = [];
+  const operation = client.stream(
+    "/api/projects/one/runs/run/stream",
+    (_, value) => frames.push(value),
+    new AbortController().signal,
+  );
+  const rejected = assert.rejects(
+    operation,
+    (error) => error.code === "SESSION_CHANGED",
+  );
+  while (!source) await new Promise((resolve) => setImmediate(resolve));
+  await client.login("bob", "password");
+  source.enqueue(
+    new TextEncoder().encode('event: run\ndata: {"text":"alice-private"}\n\n'),
+  );
+  await rejected;
+  assert.deepEqual(frames, []);
+  assert.equal(client.user.username, "bob");
+});
+
+test("access expiry inside a stream renews the session without resubmitting a message", async () => {
+  const calls = [];
+  const client = createClient(storage(), async (url) => {
+    calls.push(url);
+    if (url.endsWith("/login")) return response(tokens("alice", A));
+    if (url.endsWith("/refresh"))
+      return response(tokens("alice", A, "renewed"));
+    return new Response(
+      'event: error\ndata: {"code":"ACCESS_EXPIRED","status":401,"message":"expired"}\n\n',
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+  });
+  await client.login("alice", "password");
+  await client.stream(
+    "/api/projects/one/runs/run/stream",
+    () => {},
+    new AbortController().signal,
+  );
+  assert.equal(client.user.username, "alice");
+  assert.equal(calls.filter((url) => url.endsWith("/refresh")).length, 1);
+  assert.equal(
+    calls.some((url) => url.endsWith("/messages")),
+    false,
+  );
+});

@@ -8,14 +8,13 @@ import httpx
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
+from backend.agents.common import measured_tokens, request_budget, tool_json
 from backend.agents.consultation.prompts import ADVISE, REPLY
-from backend.agents.consultation.validation import (
+from backend.agents.consultation.state import (
     source_catalog,
     verified_patch,
 )
-from backend.agents.limits import measured_tokens, request_budget
-from backend.agents.tools.draft_agent import generate_prd
-from backend.agents.tools.registry import tool_json
+from backend.agents.tools.drafting import generate_prd
 from backend.agents.tools.web_search import PUBLIC_TOPIC_TOOL, PUBLIC_TOPICS, search_public
 from backend.db.tool_store import ToolStore
 from backend.models.consultation import (
@@ -80,6 +79,8 @@ class ConsultationNodes:
         output_limit=None,
         conversation=None,
         count_native_tools=True,
+        purpose="consultation",
+        preview_title="",
     ):
         drafting = getattr(self, "in_drafting", False)
         max_rounds = (
@@ -112,12 +113,22 @@ class ConsultationNodes:
         started = monotonic()
         self.rounds += 1
         try:
+            on_text = None
+            if not schema and (not drafting or purpose == "draft_writer"):
+                on_text = await self.agent.stream_writer(
+                    self.store,
+                    self.run_id,
+                    kind="document" if drafting else "reply",
+                    title=preview_title,
+                )
             message, usage = await self.agent.complete(
                 messages,
                 allow_tools=bool(tools),
                 max_output_tokens=allowance,
                 tools=tools,
                 json_output=bool(schema),
+                purpose=purpose,
+                on_text=on_text,
                 timeout_seconds=self.agent.settings.draft_model_timeout_seconds
                 if drafting
                 else max(self.agent.settings.timeout_seconds, 45),
@@ -127,6 +138,7 @@ class ConsultationNodes:
                 self.run_id,
                 {
                     "type": "model",
+                    "purpose": purpose,
                     "ok": False,
                     "code": error.code if isinstance(error, ProjectError) else type(error).__name__,
                     "summary": "模型暂未完成本次处理",
@@ -148,6 +160,8 @@ class ConsultationNodes:
             self.run_id,
             {
                 "type": "model",
+                "model": usage.get("model"),
+                "purpose": usage.get("purpose", purpose),
                 "summary": "调用模型整理需求",
                 "duration_ms": round((monotonic() - started) * 1000),
                 "tokens": {"total_tokens": used},

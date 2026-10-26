@@ -48,13 +48,13 @@ function button(root, text) {
     b.textContent.includes(text),
   );
 }
-function mount(handler, role = "user", props = {}) {
+function mount(handler, role = "user", props = {}, stream = undefined) {
   const root = document.createElement("div");
   document.body.append(root);
   const state = vue.reactive({ user: { id: "alice", role } });
   const View = component(
     "../src/views/ProjectsView.vue",
-    { auth: { request: handler }, authState: state },
+    { auth: { request: handler, stream }, authState: state },
     {
       "../api/projects": projects,
       "../auth/client": client,
@@ -90,6 +90,193 @@ const request = async (path) =>
       ? { items: [project], has_more: false }
       : snapshot();
 
+test("record selector uses the latest project summary without another list request", async () => {
+  const latest = { ...project, title: "设备借用管理", version: 3 };
+  let listReads = 0;
+  const view = mount(async (path) => {
+    if (path.endsWith("/agent")) return { configured: true };
+    if (path.includes("?offset=")) {
+      listReads++;
+      return { items: [project] };
+    }
+    return { ...snapshot(), project: latest };
+  });
+  try {
+    await settle();
+    const selector = view.root.querySelector("#project-select");
+    assert.match(selector.selectedOptions[0].textContent, /设备借用管理/);
+    assert.equal(selector.value, latest.id);
+    assert.equal(listReads, 1);
+  } finally {
+    view.close();
+  }
+});
+
+test("drafts never present the initial baseline or edit counter as a released version", () => {
+  assert.equal(
+    projects.itemVersionLabel({ ...doc, base_revision: 0, version: 9 }),
+    "初始需求 · 尚未发布",
+  );
+  assert.equal(projects.itemVersionLabel(doc), "基于正式 V1");
+  assert.equal(
+    projects.itemVersionLabel({ ...doc, published_revision: 2, version: 18 }),
+    "正式 V2",
+  );
+  assert.equal(projects.itemStateLabel(doc), "待双方评审");
+  assert.equal(projects.itemStateLabel({ ...doc, kind: "bug" }), "待受理");
+});
+
+test("uncertain submission retries the identical request and exposes the next review step in place", async () => {
+  let current = {
+    ...doc,
+    kind: "specification",
+    status: "draft",
+    base_revision: 0,
+    staff_confirmed: false,
+  };
+  const writes = [];
+  const view = mount(async (path, init) => {
+    if (init?.method === "POST") {
+      writes.push(init.body);
+      if (writes.length === 1) throw new client.ApiError("网络中断", 0);
+      current = { ...current, status: "submitted", version: 3 };
+      return { item: current, revision: 0 };
+    }
+    if (path.includes("/activity")) return [];
+    if (path.endsWith("/agent")) return { configured: true };
+    if (path.includes("?offset=")) return { items: [project] };
+    return { ...snapshot(), items: [current] };
+  });
+  try {
+    await settle();
+    button(view.root, "需求与变更").click();
+    await settle();
+    button(view.root, "增加预警").click();
+    await settle();
+    button(view.root, "提交评审").click();
+    await settle();
+    assert.ok(button(view.root, "提交评审").disabled);
+    const dialog = view.root.querySelector(".project-document-dialog");
+    button(dialog, "原请求重试").click();
+    await settle();
+    assert.equal(writes[0], writes[1]);
+    assert.ok(dialog.open);
+    assert.equal(button(dialog, "提交评审"), undefined);
+    assert.ok(button(dialog, "客户确认本版内容"));
+    assert.match(dialog.textContent, /等待客户与负责人确认/);
+    assert.doesNotMatch(dialog.textContent, /V0|结果待确认/);
+  } finally {
+    view.close();
+  }
+});
+
+test("last party confirmation publishes V1 and replaces approval controls without closing", async () => {
+  let current = {
+    ...doc,
+    kind: "specification",
+    base_revision: 0,
+    customer_confirmed: true,
+    staff_confirmed: false,
+  };
+  let writes = 0;
+  const view = mount(async (path, init) => {
+    if (init?.method === "POST") {
+      writes++;
+      assert.equal(JSON.parse(init.body).expected_version, 2);
+      current = {
+        ...current,
+        staff_confirmed: true,
+        status: "approved",
+        published_revision: 1,
+        version: 3,
+      };
+      return { item: current, revision: 1 };
+    }
+    if (path.includes("/activity")) return [];
+    if (path.endsWith("/agent")) return { configured: true };
+    if (path.includes("?offset=")) return { items: [project] };
+    return { ...snapshot(), items: [current] };
+  }, "admin");
+  try {
+    await settle();
+    button(view.root, "需求与变更").click();
+    await settle();
+    button(view.root, "增加预警").click();
+    await settle();
+    button(view.root, "负责人确认本版内容").click();
+    await settle();
+    assert.equal(writes, 0, "the review action must wait for confirmation");
+    assert.match(view.root.textContent, /操作确认/);
+    button(view.root, "取消操作").click();
+    await settle();
+    assert.equal(writes, 0);
+    button(view.root, "负责人确认本版内容").click();
+    await settle();
+    button(view.root, "确定执行").click();
+    await settle();
+    assert.equal(writes, 1);
+    const dialog = view.root.querySelector(".project-document-dialog");
+    assert.ok(dialog.open);
+    assert.match(dialog.textContent, /已发布正式 V1/);
+    assert.equal(button(dialog, "负责人确认本版内容"), undefined);
+    assert.equal(button(dialog, "编辑草稿"), undefined);
+  } finally {
+    view.close();
+  }
+});
+
+test("switching projects during a saved action refresh discards the old record history response", async () => {
+  const delayed = deferred();
+  let saved = false;
+  const paths = [];
+  const first = { ...doc, project_id: "first", status: "draft" };
+  const view = mount(
+    async (path, init) => {
+      paths.push(path);
+      if (init?.method === "POST") {
+        saved = true;
+        return { item: { ...first, status: "submitted", version: 3 } };
+      }
+      if (path.includes("/activity")) return [];
+      if (path.endsWith("/agent")) return { configured: true };
+      if (path.includes("?offset=")) return { items: [] };
+      if (path.includes("/items/")) return first;
+      if (path === "/api/projects/first" && saved) return delayed.promise;
+      const id = path.endsWith("/second") ? "second" : "first";
+      return {
+        ...snapshot(),
+        project: { ...project, id, title: `${id}项目` },
+        items: [first],
+      };
+    },
+    "admin",
+    { projectId: "first", initialTab: "documents", initialItemId: first.id },
+  );
+  try {
+    await settle();
+    button(
+      view.root.querySelector(".project-document-dialog"),
+      "提交评审",
+    ).click();
+    await settle();
+    view.props.initialItemId = undefined;
+    view.props.projectId = "second";
+    await settle();
+    delayed.resolve(snapshot());
+    await settle();
+    assert.equal(
+      view.root.querySelector(".project-summary h2").textContent,
+      "second项目",
+    );
+    assert.ok(
+      !paths.some((path) => path.includes("/second/activity?item_id=doc-one")),
+    );
+    assert.doesNotMatch(view.root.textContent, /暂未同步/);
+  } finally {
+    view.close();
+  }
+});
+
 test("admin detail route opens the requested project and exact business record", async () => {
   const requested = {
     ...project,
@@ -107,7 +294,7 @@ test("admin detail route opens the requested project and exact business record",
       if (path.includes("?offset=")) return { items: [project] };
       if (path.endsWith("/agent")) return { configured: true };
       if (path.endsWith(`/items/${target.id}`)) return target;
-      if (path.endsWith("/activity")) return [];
+      if (path.includes("/activity")) return [];
       return { ...snapshot(), project: requested, items: [target] };
     },
     "admin",
@@ -136,7 +323,7 @@ test("changing an admin detail route replaces the project and its open record", 
     async (path) => {
       if (path.includes("?offset=")) return { items: [] };
       if (path.endsWith("/agent")) return { configured: true };
-      if (path.endsWith("/activity")) return [];
+      if (path.includes("/activity")) return [];
       const id = path.includes("/second") ? "second" : "first";
       if (path.includes("/items/"))
         return { ...doc, id: `${id}-item`, title: `${id}需求`, project_id: id };
@@ -671,6 +858,99 @@ test("renaming the current record retains its unsent message", async () => {
     assert.equal(view.root.querySelector("#project-prompt"), input);
     assert.equal(input.value, "尚未发送的业务说明");
   } finally {
+    view.close();
+  }
+});
+
+test("workspace subscribes to the original run and replaces preview without another message POST", async () => {
+  let deliver, end;
+  let posts = 0,
+    stored = false;
+  const active = {
+    id: "run-stream",
+    prompt: "讨论预约",
+    answer: "",
+    status: "running",
+    events: [],
+    created_at: "2026-10-25T00:00:00Z",
+  };
+  const view = mount(
+    async (path, init) => {
+      if (init?.method === "POST") {
+        posts++;
+        return active;
+      }
+      if (path.endsWith("/agent")) return { configured: true };
+      if (path.includes("?offset=")) return { items: [project] };
+      return {
+        ...snapshot(),
+        runs: stored ? [{ ...active, status: "completed" }] : [],
+        messages: stored
+          ? [
+              {
+                id: "u",
+                role: "user",
+                run_id: active.id,
+                content: active.prompt,
+              },
+              {
+                id: "a",
+                role: "assistant",
+                run_id: active.id,
+                content: "从预约登记开始。",
+              },
+            ]
+          : [],
+      };
+    },
+    "user",
+    {},
+    async (path, receive) => {
+      assert.equal(
+        path,
+        `/api/projects/${project.id}/runs/${active.id}/stream`,
+      );
+      deliver = receive;
+      await new Promise((resolve) => {
+        end = resolve;
+      });
+    },
+  );
+  try {
+    await settle();
+    const input = view.root.querySelector("#project-prompt");
+    input.value = active.prompt;
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await settle();
+    button(view.root, "发送").click();
+    await settle();
+    deliver("run", {
+      ...active,
+      preview: { kind: "reply", title: "", text: "从预约" },
+    });
+    await settle();
+    assert.equal(
+      view.root.querySelector(".chat-stream-text").textContent,
+      "从预约",
+    );
+    stored = true;
+    deliver("run", {
+      ...active,
+      status: "completed",
+      answer: "从预约登记开始。",
+      preview: null,
+    });
+    end();
+    await settle();
+    assert.equal(posts, 1);
+    assert.equal(view.root.querySelector(".chat-stream-text"), null);
+    assert.equal(
+      view.root.querySelectorAll(".project-message.assistant").length,
+      1,
+    );
+    assert.match(view.root.textContent, /从预约登记开始。/);
+  } finally {
+    if (end) end();
     view.close();
   }
 });

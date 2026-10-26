@@ -1,9 +1,20 @@
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.models.consultation import Reference
 from backend.models.drafting import DraftAssumption, DraftPlan, DraftSection
+
+
+class GraphState(TypedDict):
+    input_key: str
+    draft: dict[str, Any]
+    pending: list[dict[str, Any]]
+    counters: dict[str, int]
+    expires_at: float
+    web_enabled: bool
+    body: str
+    partial: bool
 
 
 class DraftState(BaseModel):
@@ -28,6 +39,13 @@ class DraftState(BaseModel):
     direct_body: str = ""
     stop_code: str = ""
     finalization_attempted: bool = False
+
+    def observations(self):
+        """The current State is authoritative; keep the latest complete native tool exchange."""
+        for index in range(len(self.messages) - 1, -1, -1):
+            if self.messages[index]["role"] == "assistant":
+                return self.messages[index:]
+        return []
 
     def context(self, *, include_written=False):
         data = {

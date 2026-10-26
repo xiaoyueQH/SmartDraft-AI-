@@ -11,6 +11,29 @@ from backend.models.consultation import Reference
 from backend.models.drafting import DraftFinish, DraftPlan, DraftSection, WriteSection
 from backend.models.projects import ProjectError
 
+RECOVERABLE = (httpx.HTTPError, TimeoutError, ProjectError, ValueError)
+EXHAUSTED = {"MODEL_BUDGET", "TOOL_BUDGET", "TOKEN_BUDGET", "DRAFT_TIME_BUDGET"}
+
+
+def error_code(error):
+    return error.code if isinstance(error, ProjectError) else type(error).__name__
+
+
+def recoverable(error):
+    return not isinstance(error, ProjectError) or error.status >= 500
+
+
+def markdown(message, *, document=False):
+    body = message.get("content")
+    if (
+        not isinstance(body, str)
+        or len(body.strip()) < 100
+        or body.lstrip().startswith(("{", "[", "```"))
+        or (document and not body.lstrip().startswith("#"))
+    ):
+        raise ProjectError("DRAFT_TEXT_INVALID", "草案正文暂未生成", 503)
+    return body.strip()
+
 
 def tool(name, description, schema):
     return {
@@ -24,8 +47,8 @@ def tool(name, description, schema):
 
 
 class DraftTools:
-    def __init__(self, agent):
-        self.agent, self.state, self.flow = agent, agent.state, agent.flow
+    def __init__(self, runtime):
+        self.runtime, self.state, self.flow = runtime, runtime.state, runtime.flow
 
     def schemas(self, web_enabled):
         empty = {"type": "object", "properties": {}, "additionalProperties": False}
@@ -50,7 +73,6 @@ class DraftTools:
         return [*tools, PUBLIC_TOPIC_TOOL] if web_enabled else tools
 
     async def call(self, function, web_enabled):
-        from backend.agents.drafting.agent import EXHAUSTED, error_code, recoverable
 
         name, ok = function["name"], False
         try:
@@ -74,7 +96,7 @@ class DraftTools:
             elif name == "read_draft" and not args:
                 result = {
                     "ok": True,
-                    "body": self.agent.assemble()[:12000],
+                    "body": self.runtime.assemble()[:12000],
                     "failed": self.state.failures,
                 }
             elif name == "finish_draft":
@@ -84,7 +106,7 @@ class DraftTools:
                 if request.assumptions:
                     self.state.assumptions = request.assumptions
                 self.resolve(request.resolved_questions)
-                self.agent.complete(request.questions)
+                self.runtime.complete(request.questions)
                 result = {"ok": True, "partial": self.state.status == "partial"}
             else:
                 raise ValueError("Tool unavailable")
@@ -147,7 +169,6 @@ class DraftTools:
         )
 
     async def write(self, request):
-        from backend.agents.drafting.agent import EXHAUSTED, error_code, markdown, recoverable
 
         spec = (
             next((s for s in self.state.plan.sections if s.id == request.section_id), None)
@@ -188,7 +209,7 @@ class DraftTools:
         self.state.section_specs[spec.id] = spec
         try:
             await self.flow.event("draft_section", "展开本章功能与验收方式")
-            response = await self.agent.model(
+            response = await self.runtime.model(
                 SECTION,
                 {
                     **self.state.context(include_written=True),
@@ -196,10 +217,12 @@ class DraftTools:
                     "outline": self.state.plan.model_dump() if self.state.plan else None,
                 },
                 output_limit=self.flow.agent.settings.draft_section_output_tokens,
+                purpose="draft_writer",
+                preview_title=spec.title,
             )
             body = markdown(response)
             self.state.sections[spec.id] = body
-            return {"ok": True, "section_id": spec.id, "excerpt": body[:700]}
+            return {"ok": True, "section_id": spec.id, "excerpt": body[:350]}
         except (ProjectError, httpx.HTTPError, TimeoutError, ValueError) as error:
             if not recoverable(error):
                 raise
@@ -232,7 +255,7 @@ class DraftTools:
                 "message": "联网已关闭，继续整理本地资料。",
             }
         self.state.searched_topics.append(topic)
-        seconds = min(6, self.agent.remaining()["seconds"])
+        seconds = min(6, self.runtime.remaining()["seconds"])
         if seconds < 1:
             raise ProjectError("DRAFT_TIME_BUDGET", "本轮时间已用完", 503)
         refs = await search_public(
@@ -248,3 +271,26 @@ class DraftTools:
             "references": refs,
             "message": "搜索摘要仅作为建议，不是客户事实。",
         }
+
+
+async def generate_prd(flow):
+    from backend.agents.drafting.graph import create_draft
+
+    flow.calls += 1
+    if flow.calls > flow.agent.settings.draft_max_tools:
+        raise ProjectError("TOOL_BUDGET", "本次处理较多，请分阶段继续", 503)
+    flow.in_drafting = True
+    try:
+        result = await create_draft(flow)
+        await flow.store.event(
+            flow.run_id,
+            {
+                "type": "tool",
+                "tool": "generate_prd",
+                "ok": bool(result["document"]),
+                "summary": "已完成需求草案整理" if result["document"] else "还需要基本业务说明",
+            },
+        )
+        return result
+    finally:
+        flow.in_drafting = False

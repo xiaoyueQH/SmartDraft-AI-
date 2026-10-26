@@ -8,20 +8,20 @@ from test_auth import auth_api, headers, login  # noqa: F401
 from test_postgresql import postgres, postgres_auth  # noqa: F401
 from test_projects import project, wait_run
 
-from backend.agents.orchestrator import ProjectAgent
+from backend.agents.runtime import AgentRuntime
 
 
 def install_model(monkeypatch, model):
-    monkeypatch.setattr(ProjectAgent, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
 
     async def complete(self, messages, **kwargs):
         return await model.respond(messages)
 
-    monkeypatch.setattr(ProjectAgent, "complete", complete)
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
 
 
 def test_source_catalog_resolves_only_customer_evidence():
-    from backend.agents.consultation.validation import source_catalog, verified_patch
+    from backend.agents.consultation.state import source_catalog, verified_patch
     from backend.models.consultation import Extraction
 
     history = [
@@ -59,7 +59,7 @@ def test_source_catalog_resolves_only_customer_evidence():
 
 
 def test_source_catalog_has_a_bounded_context():
-    from backend.agents.consultation.validation import source_catalog
+    from backend.agents.consultation.state import source_catalog
 
     catalog = source_catalog("客户原话" * 4000, "run")
     assert sum(len(row["text"]) for row in catalog) <= 12000
@@ -67,7 +67,7 @@ def test_source_catalog_has_a_bounded_context():
 
 
 def test_exact_combined_list_sources_expand_without_accepting_fabricated_origins():
-    from backend.agents.consultation.validation import verified_patch
+    from backend.agents.consultation.state import verified_patch
     from backend.models.consultation import Extraction
 
     extraction = Extraction.model_validate(
