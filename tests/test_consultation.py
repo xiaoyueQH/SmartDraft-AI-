@@ -29,12 +29,12 @@ def test_source_catalog_resolves_only_customer_evidence():
         {"id": "assistant", "role": "assistant", "content": "建议增加营销"},
     ]
     catalog = source_catalog("只做预约", "current-run", history)
-    assert {row["id"] for row in catalog} == {"current:0", "old-user:0"}
+    assert {row["id"] for row in catalog} == {"current:0", "run:old-run:0"}
     extraction = Extraction.model_validate(
         {
             "notes": {"users": ["前台"], "scope": ["预约"]},
             "sources": [
-                {"field": "users", "value": "前台", "source_id": "old-user:0"},
+                {"field": "users", "value": "前台", "source_id": "run:old-run:0"},
                 {"field": "scope", "value": "预约", "source_id": "current:0"},
             ],
             "reply": "已记录",
@@ -44,7 +44,7 @@ def test_source_catalog_resolves_only_customer_evidence():
     assert patch == {"users": ["前台"], "scope": ["预约"]}
     assert (sources[0].quote, sources[0].message_id, sources[0].run_id) == (
         "前台负责登记",
-        "old-user",
+        "",
         "old-run",
     )
     assert (sources[1].quote, sources[1].message_id, sources[1].run_id) == (

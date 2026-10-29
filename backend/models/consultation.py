@@ -3,7 +3,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import DateTime, ForeignKey, Index, LargeBinary, String, Uuid
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, LargeBinary, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.models.drafting import DraftAssumption, DraftDecision
@@ -69,7 +69,7 @@ class Gap(BaseModel):
 
 
 class FactSource(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid")
     field: Literal[
         "subject",
         "business_background",
@@ -82,7 +82,15 @@ class FactSource(BaseModel):
         "technology_preference",
         "resolved_questions",
     ]
-    value: str = Field(min_length=1, max_length=2000)
+    value: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="只填有实际内容的事实；未说明或未选择的字段不要创建空事实。",
+    )
+    intent: Literal["stated", "preferred", "required", "excluded", "unspecified"] = Field(
+        default="stated",
+        description="原话意图：陈述事实/偏好/必须/排除/未选定。不懂、举例和请顾问推荐属于unspecified，不是技术限制。",
+    )
     quote: str = Field(
         default="",
         max_length=1000,
@@ -90,9 +98,30 @@ class FactSource(BaseModel):
     )
     run_id: str = ""
     message_id: str = ""
+    message_sha256: str = ""
+    quote_start: int | None = Field(default=None, ge=0)
+    quote_end: int | None = Field(default=None, ge=0)
+    quote_sha256: str = ""
     source_id: str = Field(
         default="", max_length=120, description="优先填写source_catalog中的片段id，由程序回填原文"
     )
+
+    @field_validator("field", "value", "intent", "run_id", "message_id", "source_id", mode="before")
+    @classmethod
+    def trim_identifiers(cls, value):
+        # Quotes must retain exact whitespace for character offsets and content hashes.
+        return value.strip() if isinstance(value, str) else value
+
+
+class FactEvidence(Base):
+    """Durable source links; the bounded consultation summary is only a working view."""
+
+    __tablename__ = "project_fact_evidence"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(ForeignKey("delivery_projects.id"), index=True)
+    recorded_run_id: Mapped[UUID] = mapped_column(ForeignKey("project_runs.id"), index=True)
+    source: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Extraction(BaseModel):
@@ -141,6 +170,21 @@ class ConsultationRecord(BaseModel):
     gaps: list[Gap] = Field(default_factory=list, max_length=15)
     conflicts: list[Gap] = Field(default_factory=list, max_length=10)
 
+    @field_validator("facts", "remove_facts", mode="before")
+    @classmethod
+    def omit_empty_facts(cls, value):
+        if not isinstance(value, list):
+            return value
+        return [
+            row
+            for row in value
+            if not (
+                isinstance(row, dict)
+                and isinstance(row.get("value"), str)
+                and not row["value"].strip()
+            )
+        ]
+
     @field_validator("reply", mode="before")
     @classmethod
     def optional_text(cls, value):
@@ -182,9 +226,21 @@ class ConsultationRecord(BaseModel):
                 notes[fact.field] = fact.value
         removals = []
         for fact in self.remove_facts:
+            if fact.field == "technology_preference" and fact.value in {
+                "待确认",
+                "未知",
+                "未说明",
+                "不确定",
+            }:
+                continue
             if fact.field not in lists - {"resolved_questions"}:
-                if fact.field not in lists and fact.field in notes:
-                    # Scalar updates already replace the old value in merge_discovery.
+                if fact.field == "technology_preference":
+                    if fact.field in notes:
+                        continue
+                    notes.setdefault("remove_facts", {}).setdefault(fact.field, []).append(
+                        fact.value
+                    )
+                    removals.append(fact)
                     continue
                 raise ValueError("该字段不能按列表纠正")
             notes.setdefault("remove_facts", {}).setdefault(fact.field, []).append(fact.value)
@@ -230,6 +286,7 @@ class ConsultationState(BaseModel):
     last_run_id: str = ""
     discussion_run_id: str = ""
     memory_pending: bool = False
+    asked_questions: list[str] = Field(default_factory=list, max_length=30)
     checkpoint_thread: str = ""
     pending_search_query: str = Field(default="", max_length=120)
     draft_paused: bool = False

@@ -15,6 +15,7 @@ from backend.db.auth_store import AuthStore
 from backend.db.cache import ReadCache
 from backend.db.session import create_database
 from backend.services.auth import AuthService
+from backend.services.flow_guard import FlowGuard
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -29,8 +30,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = resolved_settings
         app.state.request_slots = asyncio.Semaphore(resolved_settings.app.request_capacity)
         passwords = PasswordWork(resolved_settings.auth.password_workers)
-        agent = AgentRuntime(resolved_settings.agent)
+        agent = AgentRuntime(resolved_settings.agent, recovery=resolved_settings.recovery)
         app.state.agent_runtime = agent
+        guard = FlowGuard(database, cache, agent, resolved_settings.recovery)
+        app.state.flow_guard = guard
         try:
             await passwords.initialize()
             app.state.auth_service = AuthService(
@@ -39,8 +42,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 passwords,
                 resolved_settings.auth,
             )
+            if resolved_settings.recovery.enabled:
+                guard.start()
             yield
         finally:
+            await guard.close()
             await agent.close()
             await passwords.close()
             await cache.close()
@@ -52,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del app.state.request_slots
             del app.state.agent_runtime
             del app.state.read_cache
+            del app.state.flow_guard
 
     app = FastAPI(title="SupportFlow API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestAdmissionMiddleware)

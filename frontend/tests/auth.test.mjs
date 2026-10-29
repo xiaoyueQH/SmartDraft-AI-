@@ -56,6 +56,71 @@ test("tab storage persists only a session locator, never either token", async ()
   assert.equal(client.user.username, "alice");
 });
 
+for (const [status, body] of [
+  [503, ""],
+  [502, "<html>upstream failed</html>"],
+  [200, "{unfinished"],
+]) {
+  test(`incomplete or proxy response ${status} has a readable error without replay`, async () => {
+    let writes = 0;
+    const client = createClient(storage(), async (url) => {
+      if (url.endsWith("/login")) return response(tokens("alice", A));
+      writes++;
+      return new Response(body, { status });
+    });
+    await client.login("alice", "password");
+    await assert.rejects(
+      client.request("/api/projects/one/messages", { method: "POST" }),
+      (error) => {
+        assert.ok(error instanceof ApiError);
+        assert.equal(error.status, status === 200 ? 0 : status);
+        assert.match(error.message, /重试原操作/);
+        assert.doesNotMatch(error.message, /JSON|SyntaxError|upstream/);
+        return true;
+      },
+    );
+    assert.equal(writes, 1);
+    assert.equal(client.user.username, "alice");
+  });
+}
+
+test("malformed unauthorized response revokes only the current login without JSON errors", async () => {
+  const client = createClient(storage(), async (url) =>
+    url.endsWith("/login")
+      ? response(tokens("alice", A))
+      : new Response("", { status: 401 }),
+  );
+  await client.login("alice", "password");
+  await assert.rejects(client.request("/api/private"), (error) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 401);
+    assert.doesNotMatch(error.message, /JSON|SyntaxError/);
+    return true;
+  });
+  assert.equal(client.user, null);
+});
+
+test("network failure shows a readable error and never automatically repeats a write", async () => {
+  let writes = 0;
+  const client = createClient(storage(), async (url) => {
+    if (url.endsWith("/login")) return response(tokens("alice", A));
+    writes++;
+    throw new TypeError("Failed to fetch");
+  });
+  await client.login("alice", "password");
+  await assert.rejects(
+    client.request("/api/projects/one/messages", { method: "POST" }),
+    (error) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.code, "NETWORK_UNAVAILABLE");
+      assert.match(error.message, /连接暂时中断/);
+      return true;
+    },
+  );
+  assert.equal(writes, 1);
+  assert.equal(client.user.username, "alice");
+});
+
 test("two tabs independently restore different sessions in one browser", async () => {
   const fetcher = async (_url, init) => {
     const sid = init.headers.get("X-Session-ID");

@@ -93,3 +93,71 @@ async def test_draft_graph_real_postgres_checkpoint_recovery(postgres_auth):
         (await postgres_auth.login("alice", "Postgres-test-password")).access_token
     )
     await exercise_recovery(postgres_auth.store.database, principal)
+
+
+async def test_agent_revision_updates_same_item_and_retains_previous_content(auth_api):
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+    from test_auth import headers
+    from test_projects import draft, project
+
+    from backend.models.projects import ProjectItem
+    from backend.models.review import DocumentRevision
+
+    client, auth, database = auth_api
+    token = await login(client)
+    identity = headers(token)
+    principal = await auth.authenticate(token["access_token"])
+    p = await project(client, identity)
+    item = await draft(client, identity, p["id"])
+    pid, iid = UUID(p["id"]), UUID(item["id"])
+    store = ProjectStore(database)
+    async with database.session() as session:
+        for index in range(41):
+            session.add(
+                ProjectItem(
+                    project_id=pid,
+                    kind="bug",
+                    status="closed",
+                    title="较新已撤回草稿",
+                    content="保留历史",
+                    questions=[],
+                    created_by=principal.account.id,
+                    created_at=datetime.now(UTC) + timedelta(seconds=index),
+                )
+            )
+    run, _ = await store.start_run(
+        principal, pid, SendMessage(request_id=uuid4(), content="补写草案")
+    )
+    async with database.session() as session:
+        from backend.models.projects import Project
+
+        version = (await session.get(Project, pid)).version
+    target = await store.draft_target(principal, pid, version)
+    assert target["id"] == item["id"]
+    payload = {
+        "kind": "specification",
+        "title": item["title"],
+        "content": "补写后的完整正文",
+        "questions": [],
+    }
+    await store.finish(
+        principal,
+        pid,
+        UUID(run["id"]),
+        0,
+        "已补写",
+        [payload],
+        expected_version=version,
+        replacement={"id": item["id"], "version": item["version"]},
+    )
+    async with database.session() as session:
+        current = await session.get(ProjectItem, iid)
+        rows = list(await session.scalars(select(ProjectItem).where(ProjectItem.project_id == pid)))
+        history = list(
+            await session.scalars(select(DocumentRevision).where(DocumentRevision.item_id == iid))
+        )
+        assert len(rows) == 42 and current.version == item["version"] + 1
+        assert current.content == payload["content"] and current.status == "draft"
+        assert history == []

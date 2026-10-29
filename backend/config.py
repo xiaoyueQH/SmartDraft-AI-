@@ -2,11 +2,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
-from backend.core.llm.models import ModelProfile
+from backend.core.llm.models import ModelProfile, ModelPurpose
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -98,7 +98,16 @@ class AgentSettings(BaseModel):
     consultation: ModelProfile = Field(default_factory=ModelProfile)
     draft_planner: ModelProfile = Field(default_factory=ModelProfile)
     draft_writer: ModelProfile = Field(default_factory=ModelProfile)
+    draft_reviewer: ModelProfile = Field(default_factory=lambda: ModelProfile(temperature=0))
+    fallbacks: dict[ModelPurpose, ModelProfile] = Field(default_factory=dict)
+    review_max_rounds: int = Field(default=8, ge=2, le=12)
+    review_max_tools: int = Field(default=16, ge=4, le=32)
+    review_token_budget: int = Field(default=100000, ge=16000, le=200000)
+    review_run_seconds: float = Field(default=120, ge=15, le=150)
     capacity: int = Field(default=4, ge=1, le=16)
+    checkpoint_success_days: int = Field(default=1, ge=1, le=30)
+    checkpoint_failure_days: int = Field(default=7, ge=1, le=90)
+    checkpoint_cleanup_limit: int = Field(default=25, ge=1, le=100)
     timeout_seconds: float = Field(default=30, ge=1, le=45)
     run_seconds: float = Field(default=90, ge=5, le=120)
     max_rounds: int = Field(default=5, ge=2, le=8)
@@ -113,6 +122,29 @@ class AgentSettings(BaseModel):
     draft_run_seconds: float = Field(default=150, ge=30, le=150)
     draft_model_timeout_seconds: float = Field(default=60, ge=5, le=90)
     draft_history_chars: int = Field(default=200000, ge=12000, le=500000)
+
+
+class RecoverySettings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    enabled: bool = True
+    scan_seconds: float = Field(default=15, ge=1, le=60)
+    batch_size: int = Field(default=40, ge=1, le=100)
+    support_wait_seconds: int = Field(default=180, ge=30, le=3600)
+    support_reply_warn_seconds: int = Field(default=120, ge=15, le=1800)
+    support_reply_seconds: int = Field(default=300, ge=60, le=7200)
+    support_idle_seconds: int = Field(default=900, ge=120, le=86400)
+    support_notice_seconds: int = Field(default=60, ge=10, le=300)
+    support_extend_seconds: int = Field(default=300, ge=60, le=1800)
+    stalled_run_seconds: int = Field(default=180, ge=180, le=600)
+    business_remind_seconds: int = Field(default=86400, ge=300, le=604800)
+
+    @model_validator(mode="after")
+    def ordered_deadlines(self):
+        if self.support_reply_warn_seconds >= self.support_reply_seconds:
+            raise ValueError("客服回复提醒时间必须早于恢复AI时间")
+        if self.support_notice_seconds >= self.support_idle_seconds:
+            raise ValueError("接待到期预告必须短于无互动期限")
+        return self
 
 
 class Settings(BaseSettings):
@@ -130,6 +162,7 @@ class Settings(BaseSettings):
     auth: AuthSettings = Field(default_factory=AuthSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
+    recovery: RecoverySettings = Field(default_factory=RecoverySettings)
 
 
 @lru_cache(maxsize=1)

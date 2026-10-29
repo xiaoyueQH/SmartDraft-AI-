@@ -70,6 +70,35 @@ function mount(extra = {}) {
   };
 }
 
+test("persisting the input immediately keeps the current AI reply preview visible", async () => {
+  const run = agentRun("stored-input", {
+    preview: { kind: "reply", text: "正在为您梳理" },
+  });
+  const view = mount({
+    runs: [run],
+    messages: [
+      {
+        id: "raw",
+        run_id: run.id,
+        role: "user",
+        sender_type: "customer",
+        content: run.prompt,
+        created_at: run.created_at,
+      },
+    ],
+  });
+  try {
+    await settle();
+    assert.equal(view.root.querySelectorAll(".project-message.user").length, 1);
+    assert.equal(
+      view.root.querySelector(".chat-stream-text").textContent,
+      "正在为您梳理",
+    );
+  } finally {
+    view.close();
+  }
+});
+
 test("idle conversation has no execution panel and keeps the composer separate from scroll history", async () => {
   const view = mount();
   try {
@@ -422,7 +451,7 @@ test("live text is shown before saving and replaced by one stored reply on compl
   }
 });
 
-test("unfinished chapter preview stays plain text and never executes HTML", async () => {
+test("document generation shows progress without exposing partial chapter text", async () => {
   const view = mount({
     runs: [
       agentRun("chapter", {
@@ -438,11 +467,63 @@ test("unfinished chapter preview stays plain text and never executes HTML", asyn
     await settle();
     assert.match(view.root.textContent, /正在撰写：角色与权限/);
     assert.equal(view.root.querySelector(".chat-live-preview img"), null);
+    assert.equal(view.root.querySelector(".chat-stream-text"), null);
+    assert.doesNotMatch(view.root.textContent, /alert\(1\)|## 客户/);
+    const viewport = view.root.querySelector(".chat-viewport");
+    viewport.scrollTop = 40;
+    view.state.runs[0].preview.text += "尚未保存的章节后续片段";
+    await settle();
+    assert.equal(viewport.scrollTop, 40);
+    assert.doesNotMatch(view.root.textContent, /尚未保存的章节后续片段/);
     view.state.runs = [
       { ...view.state.runs[0], status: "failed", answer: "本轮暂未完成" },
     ];
     await settle();
     assert.equal(view.root.querySelector(".chat-live-preview"), null);
+  } finally {
+    view.close();
+  }
+});
+
+test("regeneration and chapter updates keep progress visible before content arrives", async () => {
+  const run = agentRun("regenerate", {
+    preview: { kind: "document", title: "技术与部署", text: "" },
+    events: [
+      { sequence: 1, type: "node", node: "draft_decide" },
+      { sequence: 2, type: "tool", tool: "generate_prd", ok: true },
+    ],
+  });
+  const view = mount({ runs: [run] });
+  try {
+    await settle();
+    assert.match(
+      view.root.textContent,
+      /正在撰写：技术与部署.*完成后可查看草案/s,
+    );
+    assert.match(view.root.textContent, /需求生成/);
+    assert.doesNotMatch(view.root.textContent, /起草/);
+    assert.equal(view.root.querySelector(".chat-stream-text"), null);
+    view.state.runs[0].preview = {
+      kind: "document",
+      title: "验收方式",
+      text: "修改中的临时文档内容",
+    };
+    await settle();
+    assert.match(view.root.textContent, /正在撰写：验收方式/);
+    assert.doesNotMatch(view.root.textContent, /修改中的临时文档内容/);
+    view.state.runs[0].status = "completed";
+    view.state.runs[0].preview = null;
+    view.state.messages = [
+      {
+        id: "saved",
+        run_id: run.id,
+        role: "assistant",
+        content: "需求已生成，请查看草案。",
+      },
+    ];
+    await settle();
+    assert.equal(view.root.querySelector(".chat-live-preview"), null);
+    assert.match(view.root.textContent, /需求已生成，请查看草案/);
   } finally {
     view.close();
   }

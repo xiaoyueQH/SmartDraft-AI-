@@ -90,6 +90,339 @@ const request = async (path) =>
       ? { items: [project], has_more: false }
       : snapshot();
 
+test("customer can request a human while AI is running and continue sending while pending", async () => {
+  const active = {
+    id: "active",
+    status: "running",
+    prompt: "原问题",
+    answer: "",
+    events: [],
+    created_at: "2026-10-25T00:00:00Z",
+  };
+  let control = {
+    mode: "ai",
+    version: 1,
+    support_id: null,
+    support_name: "",
+    last_sequence: 0,
+    facts_cursor: 0,
+    extraction_pending: false,
+    extraction_error: "",
+  };
+  let messages = [],
+    sent = 0;
+  const view = mount(async (path, init) => {
+    if (path.endsWith("/conversation/actions")) {
+      control = { ...control, mode: "pending", version: 2 };
+      return { conversation: control };
+    }
+    if (path.endsWith("/messages") && init?.method === "POST") {
+      sent++;
+      messages = [
+        {
+          id: "human-new",
+          role: "user",
+          content: "人工请帮我处理",
+          sender_type: "customer",
+          sender_id: "alice",
+        },
+      ];
+      control = { ...control, last_sequence: 1 };
+      return { delivery: "chat", status: "delivered", conversation: control };
+    }
+    if (path.endsWith("/conversation"))
+      return {
+        conversation: control,
+        messages,
+        run: active,
+        project_version: 1,
+        discovery: {},
+        memory_pending: false,
+      };
+    if (path.endsWith("/agent")) return { configured: false };
+    if (path.includes("?offset=")) return { items: [project] };
+    return {
+      ...snapshot(),
+      project: { ...project, conversation_mode: "ai", conversation_version: 1 },
+      runs: [active],
+    };
+  });
+  try {
+    await settle();
+    const contact = button(view.root, "联系人工");
+    assert.equal(contact.disabled, false);
+    contact.click();
+    await settle();
+    assert.match(view.root.textContent, /等待本轮AI完成/);
+    const input = view.root.querySelector("#project-prompt");
+    input.value = "人工请帮我处理";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await settle();
+    assert.equal(button(view.root, "发送").disabled, false);
+    button(view.root, "发送").click();
+    await settle();
+    assert.equal(sent, 1);
+    assert.match(view.root.textContent, /人工请帮我处理/);
+  } finally {
+    view.close();
+  }
+});
+
+test("assigned admin sees real message authors and can reply without a configured model", async () => {
+  let sent = 0;
+  const control = {
+    mode: "human",
+    version: 2,
+    support_id: "alice",
+    support_name: "客服一",
+    last_sequence: 2,
+    facts_cursor: 2,
+    extraction_pending: false,
+    extraction_error: "",
+  };
+  const messages = [
+    {
+      id: "customer-msg",
+      role: "user",
+      content: "我要查询订单",
+      sender_id: "customer",
+      sender_type: "customer",
+      sender_name: "小王",
+    },
+  ];
+  const view = mount(async (path, init) => {
+    if (path.endsWith("/messages") && init?.method === "POST") {
+      sent++;
+      return { delivery: "chat", conversation: control };
+    }
+    if (path.endsWith("/conversation"))
+      return {
+        conversation: control,
+        messages,
+        run: null,
+        project_version: 1,
+        discovery: {},
+        memory_pending: false,
+      };
+    if (path.endsWith("/agent")) return { configured: false };
+    if (path.includes("?offset=")) return { items: [project] };
+    return {
+      ...snapshot(),
+      project: {
+        ...project,
+        owner_id: "customer",
+        conversation_mode: "human",
+        conversation_version: 2,
+        support_id: "alice",
+      },
+      messages,
+    };
+  }, "admin");
+  try {
+    await settle();
+    assert.match(view.root.textContent, /客户 小王/);
+    const input = view.root.querySelector("#project-prompt");
+    input.value = "您好，我来帮您查一下。";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await settle();
+    assert.equal(button(view.root, "发送").disabled, false);
+    button(view.root, "发送").click();
+    await settle();
+    assert.equal(sent, 1);
+    assert.ok(button(view.root, "交还AI"));
+  } finally {
+    view.close();
+  }
+});
+
+test("document summaries fetch the complete authorized document only when opened", async () => {
+  let reads = 0;
+  const view = mount(async (path) => {
+    if (path.endsWith(`/items/${doc.id}`)) {
+      reads++;
+      return { ...doc, content: "这里才是按需读取的完整正文" };
+    }
+    if (path.includes("/activity") || path.endsWith("/history")) return [];
+    if (path.includes("/reviews")) return null;
+    if (path.endsWith("/agent")) return { configured: true };
+    if (path.includes("?offset=")) return { items: [project] };
+    return {
+      ...snapshot(),
+      items: [{ ...doc, content: "短摘要", content_loaded: false }],
+    };
+  });
+  try {
+    await settle();
+    assert.equal(reads, 0);
+    button(view.root, "需求与变更").click();
+    await settle();
+    button(view.root, "增加预警").click();
+    await settle();
+    assert.equal(reads, 1);
+    assert.match(
+      view.root.querySelector("dialog[open]").textContent,
+      /这里才是按需读取的完整正文/,
+    );
+  } finally {
+    view.close();
+  }
+});
+
+test("an older execution-details response cannot replace a newer response", async () => {
+  const responses = [];
+  const rid = "run-one";
+  const row = {
+    id: rid,
+    status: "completed",
+    prompt: "",
+    answer: "",
+    events: [],
+    created_at: "2026-10-25T00:00:00Z",
+    cache_version: 1,
+    details_loaded: false,
+  };
+  const view = mount(async (path) => {
+    if (path.endsWith(`/runs/${rid}`))
+      return new Promise((resolve) => responses.push(resolve));
+    if (path.endsWith("/agent")) return { configured: true };
+    if (path.includes("?offset=")) return { items: [project] };
+    return {
+      ...snapshot(),
+      runs: [row],
+      messages: [
+        {
+          id: "message",
+          role: "assistant",
+          content: "已完成沟通",
+          run_id: rid,
+        },
+      ],
+    };
+  });
+  try {
+    await settle();
+    const trigger = button(view.root, "查看处理过程");
+    trigger.click();
+    trigger.click();
+    await settle();
+    responses[1]({
+      ...row,
+      details_loaded: true,
+      cache_version: 3,
+      events: [{ sequence: 1, type: "node", summary: "较新的处理记录" }],
+    });
+    await settle();
+    responses[0]({
+      ...row,
+      details_loaded: true,
+      cache_version: 2,
+      events: [{ sequence: 1, type: "node", summary: "过期的处理记录" }],
+    });
+    await settle();
+    assert.ok(!view.root.textContent.includes("过期的处理记录"));
+    assert.ok(!button(view.root, "查看处理过程"));
+  } finally {
+    view.close();
+  }
+});
+
+test("an older stream frame cannot replace newly loaded execution details", async () => {
+  let deliver, end;
+  const active = {
+    id: "race-run",
+    status: "running",
+    prompt: "预约",
+    answer: "",
+    events: [],
+    created_at: "2026-10-25T00:00:00Z",
+    cache_version: 1,
+    details_loaded: false,
+  };
+  const view = mount(
+    async (path) => {
+      if (path.endsWith(`/runs/${active.id}`))
+        return {
+          ...active,
+          status: "completed",
+          cache_version: 3,
+          details_loaded: true,
+        };
+      if (path.endsWith("/agent")) return { configured: true };
+      if (path.includes("?offset=")) return { items: [project] };
+      return {
+        ...snapshot(),
+        runs: [active],
+        messages: [
+          {
+            id: "a",
+            role: "assistant",
+            content: "沟通结果",
+            run_id: active.id,
+          },
+        ],
+      };
+    },
+    "user",
+    {},
+    async (_path, receive) => {
+      deliver = receive;
+      await new Promise((resolve) => {
+        end = resolve;
+      });
+    },
+  );
+  try {
+    await settle();
+    button(view.root, "查看处理过程").click();
+    await settle();
+    deliver("run", { ...active, cache_version: 2 });
+    await settle();
+    assert.equal(view.root.querySelector(".chat-stream-text"), null);
+    assert.equal(button(view.root, "查看处理过程"), undefined);
+    assert.ok(!view.root.textContent.includes("正在回复"));
+  } finally {
+    view.close();
+    if (end) end();
+  }
+});
+
+test("initial requirement management opens the current draft instead of creating another", async () => {
+  const initial = { ...project, revision: 0, phase: "discovery" };
+  const current = {
+    ...doc,
+    kind: "specification",
+    status: "withdrawn",
+    published_revision: null,
+    base_revision: 0,
+  };
+  let writes = 0;
+  const view = mount(
+    async (path, init) => {
+      if (init?.method === "POST") writes++;
+      if (path.includes("/activity") || path.endsWith("/history")) return [];
+      if (path.includes("/reviews/latest")) return null;
+      if (path.endsWith("/agent")) return { configured: true };
+      if (path.includes("?offset=")) return { items: [initial] };
+      return { ...snapshot(), project: initial, items: [current] };
+    },
+    "admin",
+    { admin: true, projectId: initial.id },
+  );
+  try {
+    await settle();
+    button(view.root, "需求草案").click();
+    await settle();
+    assert.equal(button(view.root, "新建需求 / 变更"), undefined);
+    button(view.root, "查看最新需求").click();
+    await settle();
+    assert.match(view.root.textContent, /可编辑当前需求草案后重新提交/);
+    assert.ok(button(view.root, "编辑草稿"));
+    assert.equal(writes, 0);
+  } finally {
+    view.close();
+  }
+});
+
 test("record selector uses the latest project summary without another list request", async () => {
   const latest = { ...project, title: "设备借用管理", version: 3 };
   let listReads = 0;

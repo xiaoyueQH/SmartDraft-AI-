@@ -125,6 +125,91 @@ async def test_capability_rejected_before_transmission_and_slot_is_released():
         await models.close()
 
 
+async def test_explicit_backup_is_bounded_and_records_actual_model():
+    calls = []
+
+    def respond(request):
+        name = json.loads(request.content)["model"]
+        calls.append(name)
+        return (
+            httpx.Response(429, text="private")
+            if name == "primary"
+            else httpx.Response(
+                200,
+                json={"choices": [{"message": {"role": "assistant", "content": "backup result"}}]},
+            )
+        )
+
+    models = await factory(
+        AgentSettings(
+            consultation=ModelProfile(model="primary"),
+            fallbacks={"consultation": ModelProfile(model="backup")},
+        ),
+        respond,
+    )
+    try:
+        result, usage = await models.complete([], max_attempts=2)
+        assert result["content"] == "backup result"
+        assert calls == ["primary", "backup"]
+        assert usage["model"] == "backup" and usage["attempts"] == 2
+        assert usage["fallback_from"] == "primary"
+        calls.clear()
+        with pytest.raises(ModelError):
+            await models.complete([], max_attempts=1)
+        assert calls == ["primary"]
+    finally:
+        await models.close()
+
+
+async def test_backup_never_replays_already_visible_stream_or_auth_errors():
+    calls, received = [], []
+    mode = "stream"
+
+    def respond(request):
+        calls.append(json.loads(request.content)["model"])
+        if mode == "auth":
+            return httpx.Response(403, text="private")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=StreamBody(
+                [
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "already visible"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    },
+                ]
+            ),
+        )
+
+    async def write(text):
+        received.append(text)
+
+    models = await factory(
+        AgentSettings(
+            consultation=ModelProfile(model="primary"),
+            fallbacks={"consultation": ModelProfile(model="backup")},
+        ),
+        respond,
+    )
+    try:
+        with pytest.raises(ModelError):
+            await models.complete([], max_attempts=2, on_text=write)
+        assert calls == ["primary"] and "already visible" in received
+        mode = "auth"
+        calls.clear()
+        with pytest.raises(ModelError) as error:
+            await models.complete([], max_attempts=2)
+        assert error.value.code == "MODEL_CONFIGURATION" and calls == ["primary"]
+    finally:
+        await models.close()
+
+
 @pytest.mark.parametrize(
     "result", [[], {"choices": [None]}, {"choices": [{"message": {}}], "usage": [1]}]
 )
@@ -270,5 +355,38 @@ async def test_incomplete_stream_never_becomes_a_successful_result(finish, code)
         with pytest.raises(ModelError) as caught:
             await models.complete([], on_text=receive)
         assert caught.value.code == code and body.closed
+    finally:
+        await models.close()
+
+
+async def test_per_call_timeout_overrides_adapter_default_without_entering_provider_payload():
+    captured = []
+
+    def respond(request):
+        captured.append(request)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        )
+
+    models = await factory(AgentSettings(api_key=SecretStr("test"), timeout_seconds=30), respond)
+    try:
+        await models.complete([{"role": "user", "content": "test"}], timeout_seconds=55)
+        assert captured[0].extensions["timeout"]["read"] == 55
+        assert "timeout" not in json.loads(captured[0].content)
+    finally:
+        await models.close()
+
+
+async def test_provider_read_timeout_has_a_distinct_safe_code_and_releases_slot():
+    def respond(request):
+        raise httpx.ReadTimeout("private upstream details", request=request)
+
+    models = await factory(AgentSettings(api_key=SecretStr("test")), respond)
+    try:
+        with pytest.raises(ModelError) as error:
+            await models.complete([{"role": "user", "content": "test"}], timeout_seconds=55)
+        assert error.value.code == "MODEL_TIMEOUT"
+        assert "private upstream" not in str(error.value)
+        assert all(not slot.locked() for slot in models.slots.values())
     finally:
         await models.close()

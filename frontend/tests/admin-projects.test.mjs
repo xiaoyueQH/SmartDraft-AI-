@@ -50,18 +50,218 @@ const row = {
   created_at: "2026-10-25T00:00:00Z",
 };
 
+const supportRow = {
+  ...row,
+  conversation_mode: "human",
+  support_id: null,
+  support_name: "",
+  support_notice: "",
+  human_only: false,
+  reasons: ["waiting", "expiring"],
+  failure_summary: "",
+  deadline_at: "2026-10-30T08:03:00Z",
+  wait_since: "2026-10-30T08:00:00Z",
+};
+const supportResult = (items = [supportRow], extra = {}) => ({
+  items,
+  counts: {
+    total: 1,
+    waiting: 1,
+    expiring: 1,
+    failed: 0,
+    unanswered: 0,
+    handover: 0,
+    human_only: 0,
+  },
+  has_more: false,
+  checked_at: "2026-10-30T08:02:30Z",
+  ...extra,
+});
+const noRecords = { items: [], has_more: false };
+
+test("support inbox displays reasons, assignment and next action without starting a model", async () => {
+  const calls = [];
+  const view = mount(async (path, init) => {
+    calls.push({ path, init });
+    return path.includes("/conversations/requests")
+      ? supportResult()
+      : path.endsWith("summary")
+        ? {}
+        : noRecords;
+  });
+  try {
+    await settle();
+    const panel = view.root.querySelector(".support-inbox");
+    assert.match(panel.textContent, /等待接待/);
+    assert.match(panel.textContent, /即将到期/);
+    assert.match(panel.textContent, /尚未领取/);
+    assert.match(panel.textContent, /接管会话后回复客户/);
+    button(panel, "查看并处理").click();
+    assert.equal(view.pushed[0], "/admin/projects/project-one");
+    assert.ok(calls.every(({ init }) => init?.method !== "POST"));
+    const request = calls.find(({ path }) =>
+      path.includes("/conversations/requests"),
+    );
+    assert.equal(
+      new URL(request.path, "http://localhost").searchParams.get("scope"),
+      "all",
+    );
+  } finally {
+    view.close();
+  }
+});
+
+test("support search and reason are sent to server and failures use readable guidance", async () => {
+  const calls = [];
+  const view = mount(async (path) => {
+    if (!path.includes("/conversations/requests"))
+      return path.endsWith("summary") ? {} : noRecords;
+    calls.push(path);
+    const filtered =
+      new URL(path, "http://localhost").searchParams.get("reason") === "failed";
+    return supportResult(
+      filtered
+        ? [
+            {
+              ...supportRow,
+              reasons: ["failed"],
+              conversation_mode: "ai",
+              deadline_at: null,
+              failure_summary: "客户需重新登录",
+              support_notice: "resume_required",
+            },
+          ]
+        : [],
+    );
+  });
+  try {
+    await settle();
+    const panel = view.root.querySelector(".support-inbox");
+    const input = panel.querySelector("input");
+    input.value = "张先生";
+    input.dispatchEvent(new dom.window.Event("input"));
+    const select = panel.querySelector("select");
+    select.value = "failed";
+    select.dispatchEvent(new dom.window.Event("change"));
+    panel
+      .querySelector("form")
+      .dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
+    await settle();
+    const params = new URL(calls.at(-1), "http://localhost").searchParams;
+    assert.equal(params.get("reason"), "failed");
+    assert.equal(params.get("q"), "张先生");
+    assert.match(panel.textContent, /客户需重新登录/);
+    assert.match(panel.textContent, /联系客户重新登录，或接管后人工协助/);
+    assert.doesNotMatch(panel.textContent, /resume_required|private/);
+  } finally {
+    view.close();
+  }
+});
+
+test("failed inbox reads show a retry instead of claiming the queue is empty", async () => {
+  let failed = true;
+  const view = mount(async (path) => {
+    if (!path.includes("/conversations/requests"))
+      return path.endsWith("summary") ? {} : noRecords;
+    if (failed) throw new client.ApiError("接待服务暂时不可用", 503);
+    return supportResult();
+  });
+  try {
+    await settle();
+    const panel = view.root.querySelector(".support-inbox");
+    assert.match(panel.textContent, /接待服务暂时不可用/);
+    assert.doesNotMatch(panel.textContent, /暂无待处理接待/);
+    failed = false;
+    button(panel, "重新读取接待").click();
+    await settle();
+    assert.match(panel.textContent, /张先生/);
+    assert.doesNotMatch(panel.textContent, /接待服务暂时不可用/);
+  } finally {
+    view.close();
+  }
+});
+
+test("support rows cannot open during a pending new filter", async () => {
+  let resolve;
+  const pending = new Promise((done) => {
+    resolve = done;
+  });
+  const view = mount(async (path) => {
+    if (!path.includes("/conversations/requests"))
+      return path.endsWith("summary") ? {} : noRecords;
+    return new URL(path, "http://localhost").searchParams.get("q")
+      ? pending
+      : supportResult();
+  });
+  try {
+    await settle();
+    const panel = view.root.querySelector(".support-inbox");
+    const input = panel.querySelector("input");
+    input.value = "next";
+    input.dispatchEvent(new dom.window.Event("input"));
+    panel
+      .querySelector("form")
+      .dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
+    await settle();
+    assert.ok(button(panel, "查看并处理").disabled);
+    button(panel, "查看并处理").click();
+    assert.equal(view.pushed.length, 0);
+    resolve(supportResult([]));
+    await settle();
+    assert.equal(button(panel, "查看并处理"), undefined);
+  } finally {
+    view.close();
+  }
+});
+
+test("late support response cannot replace a newer search and stops on section change", async () => {
+  let resolve;
+  const delayed = new Promise((done) => {
+    resolve = done;
+  });
+  const view = mount(async (path) => {
+    if (!path.includes("/conversations/requests"))
+      return path.endsWith("summary") ? {} : noRecords;
+    return new URL(path, "http://localhost").searchParams.get("q")
+      ? supportResult([{ ...supportRow, customer_name: "最新查询客户" }])
+      : delayed;
+  });
+  try {
+    await settle();
+    const panel = view.root.querySelector(".support-inbox");
+    const input = panel.querySelector("input");
+    input.value = "最新";
+    input.dispatchEvent(new dom.window.Event("input"));
+    panel
+      .querySelector("form")
+      .dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
+    await settle();
+    resolve(supportResult([{ ...supportRow, customer_name: "过期客户" }]));
+    await settle();
+    assert.match(panel.textContent, /最新查询客户/);
+    assert.doesNotMatch(panel.textContent, /过期客户/);
+    view.state.section = "projects";
+    await settle();
+    assert.equal(view.root.querySelector(".support-inbox"), null);
+  } finally {
+    view.close();
+  }
+});
+
 test("admin landing page shows real business totals and customer records instead of a chat", async () => {
   const view = mount(async (path) =>
-    path.endsWith("/summary")
-      ? {
-          consultations: 3,
-          projects: 2,
-          pending_reviews: 1,
-          active_tasks: 4,
-          active_deliveries: 0,
-          open_service: 5,
-        }
-      : { items: [row], has_more: false },
+    path.includes("/conversations/requests")
+      ? { items: [], counts: { total: 0 }, has_more: false }
+      : path.endsWith("/summary")
+        ? {
+            consultations: 3,
+            projects: 2,
+            pending_reviews: 1,
+            active_tasks: 4,
+            active_deliveries: 0,
+            open_service: 5,
+          }
+        : { items: [row], has_more: false },
   );
   try {
     await settle();

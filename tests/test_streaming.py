@@ -10,6 +10,22 @@ from backend.agents.runtime import AgentRuntime
 from backend.models.projects import ProjectError
 
 
+async def test_question_filter_also_bounds_streaming_preview(auth_api):
+    from backend.agents.consultation.state import limit_questions
+    from backend.db.project_store import ProjectStore
+
+    client, _, database = auth_api
+    runtime = client._transport.app.state.agent_runtime
+    store = ProjectStore(database)
+    rid = uuid4()
+    write = await runtime.stream_writer(store, rid, transform=lambda text: limit_questions(text)[0])
+    for delta in ("先梳理。谁接单？", "怎么分派？", "什么界面？", "什么语言？"):
+        await write(delta)
+        preview = await runtime.preview(store, rid)
+        assert preview["text"].count("？") <= 2
+    assert "什么界面" not in preview["text"] and "什么语言" not in preview["text"]
+
+
 def frames(response):
     return [
         (frame.splitlines()[0], json.loads(frame.split("data: ", 1)[1]))

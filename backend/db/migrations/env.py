@@ -5,7 +5,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.config import get_settings
-from backend.models import consultation, projects  # noqa: F401
+from backend.models import consultation, projects, review  # noqa: F401
 from backend.models.orm import Base
 
 target_metadata = Base.metadata

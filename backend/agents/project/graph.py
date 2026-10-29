@@ -44,6 +44,8 @@ class ProjectWorkflow(ProjectNodes):
                 "pending": [],
                 "answer": "",
                 "tokens": 0,
+                "drafts": [],
+                "notes": [],
             },
             config={"recursion_limit": 20},
         )
@@ -56,6 +58,6 @@ class ProjectWorkflow(ProjectNodes):
             self.run_id,
             self.snapshot["project"]["revision"],
             answer,
-            self.toolset.drafts,
-            self.toolset.notes,
+            result["drafts"],
+            result["notes"],
         )

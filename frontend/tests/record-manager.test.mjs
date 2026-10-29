@@ -186,3 +186,40 @@ test("restoring a record also requires checking the confirmation", async () => {
     view.close();
   }
 });
+
+test("invisible-only rename is blocked on submit while a family emoji remains valid", async () => {
+  const writes = [];
+  const view = mount(async (path, init) => {
+    if (init?.method === "POST") {
+      writes.push(JSON.parse(init.body));
+      return { items: [row("one")] };
+    }
+    return { items: [row("one")] };
+  });
+  try {
+    await settle();
+    button(view.root, "重命名").click();
+    await settle();
+    const input = view.root.querySelector('form input:not([type="checkbox"])');
+    input.value = "\u200b\u200d";
+    assert.equal(view.root.querySelector(".record-ack"), null);
+    input.dispatchEvent(new dom.window.Event("input"));
+    await settle();
+    view.root
+      .querySelector("form")
+      .dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
+    await settle();
+    assert.equal(writes.length, 0);
+    assert.match(view.root.textContent, /可见文字或符号/);
+    input.value = "报修 👨‍👩‍👧";
+    input.dispatchEvent(new dom.window.Event("input"));
+    await settle();
+    view.root
+      .querySelector("form")
+      .dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
+    await settle();
+    assert.equal(writes[0].title, "报修 👨‍👩‍👧");
+  } finally {
+    view.close();
+  }
+});

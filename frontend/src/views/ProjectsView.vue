@@ -20,10 +20,14 @@ import {
   type Project,
   type ProjectDetail,
   type ProjectItem,
+  type ConversationStatus,
+  type ConversationSnapshot,
 } from "../api/projects";
 import RequirementDocument from "../components/RequirementDocument.vue";
 import RecordManager from "../components/RecordManager.vue";
 import ConversationPanel from "../components/ConversationPanel.vue";
+import DocumentReview from "../components/DocumentReview.vue";
+import ConversationHistory from "../components/ConversationHistory.vue";
 
 const props = defineProps<{
   projectId?: string;
@@ -74,6 +78,154 @@ const comparison = ref<{
   comparing = ref(false);
 const createdToOpen = ref<Project | null>(null);
 const showNotes = ref(false);
+const documentBusy = ref(false);
+const conversation = ref<ConversationStatus | null>(null);
+const supportChoices = ref<User[]>([]),
+  transferTarget = ref("");
+let conversationController: AbortController | null = null;
+let conversationTimer: ReturnType<typeof setTimeout> | null = null;
+function stopConversation() {
+  conversationController?.abort();
+  conversationController = null;
+  if (conversationTimer) clearTimeout(conversationTimer);
+  conversationTimer = null;
+}
+function applyConversation(
+  next: ConversationSnapshot,
+  id: string,
+  current: number,
+) {
+  if (
+    disposed ||
+    current !== generation ||
+    selected.value !== id ||
+    !detail.value
+  )
+    return;
+  if (
+    conversation.value &&
+    (next.conversation.version < conversation.value.version ||
+      next.conversation.last_sequence < conversation.value.last_sequence)
+  )
+    return;
+  const previousVersion = detail.value.project.version;
+  conversation.value = next.conversation;
+  detail.value.messages = next.messages;
+  detail.value.project.conversation_mode = next.conversation.mode;
+  detail.value.project.support_id = next.conversation.support_id;
+  detail.value.project.conversation_version = next.conversation.version;
+  if (next.project_version >= detail.value.project.version) {
+    detail.value.project.version = next.project_version;
+    detail.value.project.discovery = next.discovery;
+    if (detail.value.project.consultation)
+      detail.value.project.consultation.memory_pending = next.memory_pending;
+  }
+  if (
+    next.run &&
+    (!run.value ||
+      run.value.id !== next.run.id ||
+      (next.run.cache_version || 0) >= (run.value.cache_version || 0))
+  )
+    run.value = next.run;
+  if (
+    next.project_version > previousVersion &&
+    !saving.value &&
+    !documentBusy.value
+  )
+    void refresh().catch((error) => {
+      if (!disposed && current === generation) notice.value = errorText(error);
+    });
+}
+function startConversationFeed(id: string, current: number) {
+  stopConversation();
+  const controller = new AbortController();
+  conversationController = controller;
+  async function follow() {
+    try {
+      if (typeof auth.stream === "function") {
+        await auth.stream(
+          `/api/projects/${id}/conversation/stream`,
+          (event, data) => {
+            if (!controller.signal.aborted && event === "conversation")
+              applyConversation(data as ConversationSnapshot, id, current);
+          },
+          controller.signal,
+        );
+      } else {
+        const result = await auth.request<ConversationSnapshot>(
+          `/api/projects/${id}/conversation`,
+        );
+        if (!controller.signal.aborted) applyConversation(result, id, current);
+      }
+    } catch (error) {
+      if (controller.signal.aborted || disposed || current !== generation)
+        return;
+      if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
+        notice.value = errorText(error);
+        return;
+      }
+      try {
+        const result = await auth.request<ConversationSnapshot>(
+          `/api/projects/${id}/conversation`,
+        );
+        if (!controller.signal.aborted) applyConversation(result, id, current);
+      } catch {
+        /* Next authorized read retries; messages are never resubmitted. */
+      }
+    }
+    if (!controller.signal.aborted && !disposed && current === generation)
+      conversationTimer = setTimeout(follow, 1500);
+  }
+  void follow();
+}
+async function controlConversation(action: string) {
+  if (!conversation.value) return;
+  const id = selected.value,
+    current = generation;
+  const result = await write(`/api/projects/${id}/conversation/actions`, {
+    request_id: crypto.randomUUID(),
+    expected_version: conversation.value.version,
+    action,
+    support_id: action === "transfer" ? transferTarget.value : undefined,
+  });
+  if (result && !disposed && current === generation && selected.value === id) {
+    conversation.value = result.conversation as ConversationStatus;
+    transferTarget.value = "";
+    supportChoices.value = [];
+  }
+}
+async function chooseSupport() {
+  const current = generation;
+  try {
+    const users = await auth.request<User[]>("/api/admin/users?limit=100");
+    if (!disposed && current === generation)
+      supportChoices.value = users.filter(
+        (user) =>
+          user.role === "admin" &&
+          user.is_active &&
+          user.id !== authState.user?.id,
+      );
+  } catch (error) {
+    if (!disposed && current === generation) notice.value = errorText(error);
+  }
+}
+
+function documentChanged(item: ProjectItem) {
+  if (opened.value?.id !== item.id) return;
+  opened.value = item;
+  Object.assign(itemForm, {
+    title: item.title,
+    content: item.content,
+    questions: item.questions.join("\n"),
+  });
+  if (detail.value)
+    detail.value.items = detail.value.items.map((row) =>
+      row.id === item.id ? item : row,
+    );
+  void refresh().catch((error) => {
+    notice.value = errorText(error);
+  });
+}
 const searchAvailable = ref(false),
   webSearch = ref(false);
 let toolsTimer: ReturnType<typeof setTimeout> | null = null;
@@ -133,6 +285,8 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let streamController: AbortController | null = null;
 let generation = 0,
   disposed = false;
+let itemLoadGeneration = 0;
+let runLoadGeneration = 0;
 let consultationTrigger: HTMLElement | null = null,
   itemTrigger: HTMLElement | null = null;
 
@@ -173,9 +327,13 @@ const itemNextStep = computed(() => {
   if (item.status === "approved")
     return `已发布正式 V${item.published_revision}，本版内容已锁定。后续调整请新建需求变更。`;
   if (item.status === "rejected")
-    return "负责人已驳回，请根据处理意见整理新的草稿后重新提交。";
+    return item.kind === "specification"
+      ? "负责人已驳回，请编辑当前需求草案后重新提交。"
+      : "负责人已驳回，请根据处理意见整理新的草稿后重新提交。";
   if (item.status === "withdrawn")
-    return "本次申请已撤回，可整理新的草稿后提交。";
+    return item.kind === "specification"
+      ? "本次申请已撤回，可编辑当前需求草案后重新提交。"
+      : "本次申请已撤回，可整理新的草稿后提交。";
   if (item.questions.length)
     return `还有 ${item.questions.length} 项待确认。可先提交评审讨论；补齐后编辑草稿并重新提交，双方才能确认发布。`;
   if (item.status === "draft")
@@ -211,6 +369,11 @@ const visibleItems = computed(() => {
     (i) => i.kind === (tab.value === "tasks" ? "task" : "acceptance"),
   );
 });
+const currentRequirement = computed(() =>
+  [...(detail.value?.items || []), ...olderItems.value].find(
+    (item) => item.kind === "specification" && !item.published_revision,
+  ),
+);
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : "操作未完成，请稍后重试";
 }
@@ -257,9 +420,10 @@ async function refresh() {
   } else run.value = next.runs[0] || null;
 }
 async function selectProject(id: string) {
-  if (saving.value || pending.value) return;
+  if (saving.value || pending.value || documentBusy.value) return;
   const current = ++generation;
   stopPoll();
+  stopConversation();
   loading.value = true;
   notice.value = "";
   try {
@@ -273,6 +437,18 @@ async function selectProject(id: string) {
     if (disposed || current !== generation) return;
     selected.value = id;
     detail.value = next;
+    conversation.value = next.project.conversation_mode
+      ? {
+          mode: next.project.conversation_mode,
+          version: next.project.conversation_version || 1,
+          support_id: next.project.support_id || null,
+          support_name: "",
+          last_sequence: 0,
+          facts_cursor: 0,
+          extraction_pending: false,
+          extraction_error: "",
+        }
+      : null;
     syncProjectSummary(next.project);
     configured.value = status.configured;
     searchAvailable.value = !!status.tools?.web_search?.enabled;
@@ -287,6 +463,7 @@ async function selectProject(id: string) {
       next.runs.find((r) => r.status === "running") || next.runs[0] || null;
     if (run.value?.status === "running")
       schedulePoll(id, run.value.id, current);
+    if (conversation.value) startConversationFeed(id, current);
   } catch (error) {
     if (!disposed && current === generation) {
       notice.value = errorText(error);
@@ -297,12 +474,14 @@ async function selectProject(id: string) {
       if (selector) selector.value = selected.value;
       if (run.value?.status === "running")
         schedulePoll(selected.value, run.value.id, current);
+      if (conversation.value) startConversationFeed(selected.value, current);
     }
   } finally {
     if (current === generation) loading.value = false;
   }
 }
 function schedulePoll(projectId: string, runId: string, current: number) {
+  if (conversation.value) return;
   stopPoll();
   if (typeof auth.stream === "function") {
     const controller = new AbortController();
@@ -332,6 +511,11 @@ async function followRun(
           return;
         const next = data as AgentRun;
         if (next.id !== runId) return;
+        if (run.value?.id !== runId) return;
+        if ((run.value.cache_version || 0) > (next.cache_version || 0)) {
+          finished = run.value.status !== "running";
+          return;
+        }
         run.value = next;
         finished = next.status !== "running";
       },
@@ -361,7 +545,9 @@ function scheduleFallback(projectId: string, runId: string, current: number) {
         `/api/projects/${projectId}/runs/${runId}`,
       );
       if (disposed || current !== generation) return;
-      run.value = next;
+      if (run.value?.id !== runId) return;
+      if ((next.cache_version || 0) >= (run.value.cache_version || 0))
+        run.value = next;
       if (next.status === "running") schedulePoll(projectId, runId, current);
       else {
         await refresh();
@@ -411,9 +597,17 @@ async function retry() {
     if (!result) return;
     if (original.endsWith("/messages")) {
       prompt.value = "";
-      run.value = result as unknown as AgentRun;
-      if (run.value.status === "running")
-        schedulePoll(selected.value, run.value.id, generation);
+      if (result.delivery === "chat")
+        conversation.value = result.conversation as ConversationStatus;
+      else {
+        run.value = result as unknown as AgentRun;
+        if (run.value.status === "running")
+          schedulePoll(selected.value, run.value.id, generation);
+      }
+    }
+    if (original.endsWith("/conversation/actions")) {
+      conversation.value = result.conversation as ConversationStatus;
+      return;
     }
     if (original === "/api/consultations") {
       closeConsultation();
@@ -502,7 +696,7 @@ function closeConsultation() {
   consultationTrigger?.focus();
 }
 function closeItem() {
-  if (saving.value || pending.value) return;
+  if (saving.value || pending.value || documentBusy.value) return;
   itemDialog.value?.close();
   opened.value = null;
   itemTrigger?.focus();
@@ -551,6 +745,14 @@ async function regenerateRequirements() {
 }
 function openNewItem() {
   if (!detail.value || pending.value) return;
+  if (
+    tab.value === "documents" &&
+    !detail.value.project.revision &&
+    currentRequirement.value
+  ) {
+    void openItem(currentRequirement.value);
+    return;
+  }
   itemTrigger = rememberTrigger();
   opened.value = null;
   editing.value = true;
@@ -570,7 +772,26 @@ function openNewItem() {
 }
 async function openItem(item: ProjectItem) {
   const current = generation,
-    projectId = selected.value;
+    projectId = selected.value,
+    load = ++itemLoadGeneration;
+  if (item.content_loaded === false) {
+    try {
+      item = await auth.request<ProjectItem>(
+        `/api/projects/${projectId}/items/${item.id}`,
+      );
+    } catch (error) {
+      if (!disposed && current === generation && load === itemLoadGeneration)
+        notice.value = errorText(error);
+      return;
+    }
+    if (
+      disposed ||
+      current !== generation ||
+      projectId !== selected.value ||
+      load !== itemLoadGeneration
+    )
+      return;
+  }
   comparison.value = null;
   itemTrigger = rememberTrigger();
   opened.value = item;
@@ -597,6 +818,35 @@ async function openItem(item: ProjectItem) {
       itemHistory.value = history;
   } catch {
     /* The record stays readable if its activity cannot be loaded. */
+  }
+}
+async function loadRun(runId: string) {
+  const current = generation,
+    projectId = selected.value,
+    load = ++runLoadGeneration;
+  try {
+    const result = await auth.request<AgentRun>(
+      `/api/projects/${projectId}/runs/${runId}`,
+    );
+    if (
+      disposed ||
+      current !== generation ||
+      load !== runLoadGeneration ||
+      selected.value !== projectId ||
+      !detail.value
+    )
+      return;
+    const latest =
+      run.value?.id === runId
+        ? run.value
+        : detail.value.runs.find((row) => row.id === runId);
+    if ((latest?.cache_version || 0) > (result.cache_version || 0)) return;
+    detail.value.runs = detail.value.runs.map((row) =>
+      row.id === runId ? result : row,
+    );
+    if (run.value?.id === runId) run.value = result;
+  } catch (error) {
+    if (!disposed && current === generation) notice.value = errorText(error);
   }
 }
 async function compareDocument() {
@@ -627,6 +877,7 @@ async function recordsChanged(items: Project[]) {
   if (removedCurrent) {
     generation++;
     stopPoll();
+    stopConversation();
     selected.value = "";
     detail.value = null;
     run.value = null;
@@ -709,7 +960,8 @@ async function saveItem() {
   }
 }
 async function action(value: string) {
-  if (!opened.value || saving.value || pending.value) return;
+  if (!opened.value || saving.value || pending.value || documentBusy.value)
+    return;
   const label = (
     {
       confirm: "确认本版内容",
@@ -814,8 +1066,18 @@ async function send(
   intent: "chat" | "draft" = "chat",
   suggestion?: { id: string; accept: boolean },
 ) {
-  if (!prompt.value.trim() || running.value || !configured.value) return;
-  const result = await write(`/api/projects/${selected.value}/messages`, {
+  const id = selected.value,
+    current = generation;
+  const manualChat =
+    intent === "chat" &&
+    !!conversation.value &&
+    conversation.value.mode !== "ai";
+  if (
+    !prompt.value.trim() ||
+    (!manualChat && (running.value || !configured.value))
+  )
+    return;
+  const result = await write(`/api/projects/${id}/messages`, {
     request_id: crypto.randomUUID(),
     content: prompt.value.trim(),
     intent,
@@ -824,8 +1086,16 @@ async function send(
     rejected_suggestions:
       suggestion && !suggestion.accept ? [suggestion.id] : [],
   });
-  if (result) {
+  if (result && !disposed && current === generation && selected.value === id) {
     prompt.value = "";
+    if (result.delivery === "chat") {
+      conversation.value = result.conversation as ConversationStatus;
+      const snapshot = await auth.request<ConversationSnapshot>(
+        `/api/projects/${id}/conversation`,
+      );
+      applyConversation(snapshot, id, current);
+      return;
+    }
     run.value = result as unknown as AgentRun;
     if (run.value.status === "running")
       schedulePoll(selected.value, run.value.id, generation);
@@ -883,7 +1153,11 @@ function download(item: ProjectItem) {
 }
 function allowNavigation(to: { path: string }) {
   if (
-    (saving.value || starting.value || recordBusy.value || pending.value) &&
+    (saving.value ||
+      starting.value ||
+      recordBusy.value ||
+      pending.value ||
+      documentBusy.value) &&
     to.path !== "/login"
   ) {
     notice.value = "请先确认当前保存结果，再离开项目";
@@ -952,6 +1226,7 @@ onUnmounted(() => {
   disposed = true;
   generation++;
   stopPoll();
+  stopConversation();
   if (toolsTimer) clearTimeout(toolsTimer);
 });
 </script>
@@ -1123,6 +1398,139 @@ onUnmounted(() => {
           操作记录
         </button>
       </nav>
+      <section
+        v-if="tab === 'conversation' && conversation"
+        class="conversation-controls"
+      >
+        <div>
+          <strong>{{
+            conversation.mode === "ai"
+              ? "AI接待中"
+              : conversation.mode === "pending"
+                ? "已联系人工，等待本轮AI完成"
+                : conversation.support_name
+                  ? `客服 ${conversation.support_name} 接待中`
+                  : "已联系人工，等待客服接入"
+          }}</strong>
+          <p v-if="conversation.mode === 'pending'">
+            本轮回复或操作会完整保留；结束后接入人工，不再开启新的自动回复。
+          </p>
+          <p v-if="conversation.human_only && conversation.mode !== 'ai'">
+            您已选择只等人工，不会自动恢复AI。
+          </p>
+          <p
+            v-else-if="
+              conversation.mode === 'human' && conversation.deadline_at
+            "
+          >
+            若仍无人回复或接待无互动，将于
+            {{
+              new Date(conversation.deadline_at).toLocaleTimeString("zh-CN", {
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            }}
+            恢复AI；正在执行的操作会先完成。
+          </p>
+        </div>
+        <button
+          v-if="isCustomer && conversation.mode === 'ai'"
+          class="button button-outline"
+          :disabled="saving || !!pending"
+          @click="controlConversation('request_human')"
+        >
+          联系人工
+        </button>
+        <template v-if="isCustomer && conversation.mode !== 'ai'">
+          <button
+            v-if="!conversation.human_only"
+            class="text-button"
+            :disabled="saving || !!pending"
+            @click="controlConversation('wait_human')"
+          >
+            只等人工
+          </button>
+          <button
+            v-if="conversation.mode === 'human'"
+            class="text-button"
+            :disabled="saving || !!pending"
+            @click="controlConversation('resume_ai')"
+          >
+            恢复AI接待
+          </button>
+        </template>
+        <button
+          v-if="
+            admin && (!conversation.support_id || conversation.mode === 'ai')
+          "
+          class="button button-dark"
+          :disabled="saving || !!pending"
+          @click="controlConversation('takeover')"
+        >
+          接管会话
+        </button>
+        <template
+          v-if="
+            admin &&
+            conversation.support_id === authState.user?.id &&
+            conversation.mode === 'human'
+          "
+        >
+          <button
+            class="button button-outline"
+            :disabled="saving || !!pending"
+            @click="controlConversation('release')"
+          >
+            交还AI
+          </button>
+          <button class="text-button" @click="chooseSupport">转交客服</button>
+          <button
+            class="text-button"
+            :disabled="saving || !!pending"
+            @click="controlConversation('extend')"
+          >
+            仍在处理，延长等待
+          </button>
+          <template v-if="supportChoices.length"
+            ><select v-model="transferTarget" aria-label="接待客服">
+              <option value="">请选择客服</option>
+              <option
+                v-for="user in supportChoices"
+                :key="user.id"
+                :value="user.id"
+              >
+                {{ user.display_name }}
+              </option></select
+            ><button
+              class="button button-outline"
+              :disabled="!transferTarget || saving"
+              @click="controlConversation('transfer')"
+            >
+              确认转交
+            </button></template
+          >
+        </template>
+        <ConversationHistory
+          :project-id="selected"
+          :customer-id="detail.project.owner_id"
+          :administrator="admin"
+        />
+        <p
+          v-if="admin && conversation.extraction_pending"
+          class="project-muted"
+        >
+          {{
+            conversation.extraction_error ||
+            "客户信息正在后台整理，聊天可正常进行。"
+          }}<button
+            v-if="conversation.extraction_error"
+            class="text-button"
+            @click="controlConversation('retry_extraction')"
+          >
+            重新整理信息
+          </button>
+        </p>
+      </section>
       <div
         v-if="tab === 'conversation'"
         class="project-conversation"
@@ -1134,12 +1542,17 @@ onUnmounted(() => {
           :messages="detail.messages"
           :runs="conversationRuns"
           :configured="configured"
+          :mode="conversation?.mode"
+          :viewer-id="authState.user?.id"
+          :administrator="admin"
+          :support-id="conversation?.support_id"
           :locked="saving || !!pending"
           :sending="saving"
           :outgoing="outgoing"
           :search-available="searchAvailable"
           v-model:web-search="webSearch"
           @send="send"
+          @load-run="loadRun"
         />
         <aside
           v-if="discovery"
@@ -1304,7 +1717,9 @@ onUnmounted(() => {
           >
             {{
               tab === "documents"
-                ? "新建需求 / 变更"
+                ? !detail.project.revision && currentRequirement
+                  ? "查看最新需求"
+                  : "新建需求 / 变更"
                 : tab === "service"
                   ? "提交故障 / 咨询"
                   : tab === "tasks"
@@ -1365,7 +1780,7 @@ onUnmounted(() => {
           <button
             type="button"
             class="text-button"
-            :disabled="saving || !!pending"
+            :disabled="saving || !!pending || documentBusy"
             @click="closeConsultation"
           >
             关闭
@@ -1383,7 +1798,10 @@ onUnmounted(() => {
           </select></label
         >
         <p v-if="pending" role="status">保存结果待确认，请关闭窗口前先重试。</p>
-        <button class="button button-dark" :disabled="saving || !!pending">
+        <button
+          class="button button-dark"
+          :disabled="saving || !!pending || documentBusy"
+        >
           {{ saving ? "保存中…" : "开始沟通" }}</button
         ><button
           v-if="pending"
@@ -1412,7 +1830,7 @@ onUnmounted(() => {
         </div>
         <button
           class="text-button"
-          :disabled="saving || !!pending"
+          :disabled="saving || !!pending || documentBusy"
           @click="closeItem"
         >
           关闭
@@ -1429,6 +1847,17 @@ onUnmounted(() => {
       >
         原请求重试
       </button>
+      <DocumentReview
+        v-if="opened && isDocument"
+        v-show="!editing && !actionConfirmation"
+        :key="opened.id"
+        :project-id="selected"
+        :item="opened"
+        :configured="configured"
+        :locked="saving || !!pending || editing || !!actionConfirmation"
+        @changed="documentChanged"
+        @busy="documentBusy = $event"
+      />
       <form v-if="editing" @submit.prevent="saveItem">
         <label v-if="!opened"
           >记录类型<select v-model="itemForm.kind">
@@ -1463,7 +1892,10 @@ onUnmounted(() => {
             v-model="itemForm.questions"
             rows="3"
           ></textarea></label
-        ><button class="button button-dark" :disabled="saving || !!pending">
+        ><button
+          class="button button-dark"
+          :disabled="saving || !!pending || documentBusy"
+        >
           保存草稿</button
         ><button
           v-if="opened"
@@ -1502,7 +1934,7 @@ onUnmounted(() => {
           </button>
           <button
             class="button button-dark"
-            :disabled="saving || !!pending"
+            :disabled="saving || !!pending || documentBusy"
             @click="confirmAction"
           >
             确定执行
@@ -1515,18 +1947,21 @@ onUnmounted(() => {
             导出 Markdown</button
           ><button
             v-if="
-              ['draft', 'submitted'].includes(opened.status) &&
+              (['draft', 'submitted'].includes(opened.status) ||
+                (opened.kind === 'specification' &&
+                  !opened.published_revision &&
+                  ['rejected', 'withdrawn'].includes(opened.status))) &&
               (isDocument || admin || opened.created_by === authState.user?.id)
             "
             class="button button-outline"
-            :disabled="saving || !!pending"
+            :disabled="saving || !!pending || documentBusy"
             @click="editing = true"
           >
             编辑草稿</button
           ><button
             v-if="opened.status === 'draft'"
             class="button button-dark"
-            :disabled="saving || !!pending"
+            :disabled="saving || !!pending || documentBusy"
             @click="action('submit')"
           >
             {{ isDocument ? "提交评审" : "提交受理" }}</button
@@ -1545,7 +1980,7 @@ onUnmounted(() => {
           ><button
             v-if="!isDocument && admin && opened.status === 'submitted'"
             class="button button-dark"
-            :disabled="saving || !!pending"
+            :disabled="saving || !!pending || documentBusy"
             @click="action('start')"
           >
             开始处理</button
@@ -1703,3 +2138,21 @@ onUnmounted(() => {
     />
   </section>
 </template>
+
+<style scoped>
+.conversation-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  margin-bottom: 12px;
+  border: 1px solid #dce5ef;
+  border-radius: 6px;
+  background: #f7faff;
+}
+.conversation-controls p {
+  margin: 4px 0;
+  line-height: 1.6;
+}
+</style>

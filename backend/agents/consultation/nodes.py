@@ -8,10 +8,18 @@ import httpx
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
-from backend.agents.common import measured_tokens, request_budget, tool_json
+from backend.agents.common import (
+    draft_revision_requested,
+    measured_tokens,
+    request_budget,
+    tool_json,
+)
 from backend.agents.consultation.prompts import ADVISE, REPLY
 from backend.agents.consultation.state import (
+    ConsultationPayload,
+    limit_questions,
     source_catalog,
+    valid_draft_request,
     verified_patch,
 )
 from backend.agents.tools.drafting import generate_prd
@@ -49,10 +57,12 @@ class ConsultationNodes:
         self.patches, self.drafts = [], []
         self.rounds, self.tokens, self.calls = 0, 0, 0
         self.extraction = None
+        self.record_retried = False
         self.decision = DraftDecision()
         self.answer = ""
         self.discussion_saved = False
         self.expected_version = snapshot["project"]["version"]
+        self.replacement = None
 
     async def event(self, node, summary, **extra):
         await self.store.event(
@@ -67,7 +77,12 @@ class ConsultationNodes:
             "suggestions": [item.model_dump() for item in self.state.suggestions],
             "references": [item.model_dump() for item in self.state.references],
             "draft_assumptions": [item.model_dump() for item in self.state.draft_assumptions],
+            "previously_asked": self.state.asked_questions,
         }
+
+    def public_reply(self, text):
+        limit = 0 if re.search(r"先记录|只记录|先别问|不要再问", self.prompt) else 2
+        return limit_questions(text, self.state.asked_questions, limit=limit)
 
     async def model(
         self,
@@ -81,6 +96,7 @@ class ConsultationNodes:
         count_native_tools=True,
         purpose="consultation",
         preview_title="",
+        tool_choice=None,
     ):
         drafting = getattr(self, "in_drafting", False)
         max_rounds = (
@@ -114,18 +130,25 @@ class ConsultationNodes:
         self.rounds += 1
         try:
             on_text = None
-            if not schema and (not drafting or purpose == "draft_writer"):
+            if (
+                not getattr(self, "silent", False)
+                and not schema
+                and (not drafting or purpose == "draft_writer")
+            ):
                 on_text = await self.agent.stream_writer(
                     self.store,
                     self.run_id,
                     kind="document" if drafting else "reply",
                     title=preview_title,
+                    transform=(lambda text: self.public_reply(text)[0]) if not drafting else None,
                 )
             message, usage = await self.agent.complete(
                 messages,
                 allow_tools=bool(tools),
                 max_output_tokens=allowance,
                 tools=tools,
+                tool_choice=tool_choice,
+                max_attempts=min(2, max_rounds - self.rounds + 1),
                 json_output=bool(schema),
                 purpose=purpose,
                 on_text=on_text,
@@ -146,6 +169,7 @@ class ConsultationNodes:
                 },
             )
             raise
+        self.rounds += max(0, usage.get("attempts", 1) - 1)
         if count_native_tools:
             self.calls += len(message.get("tool_calls") or [])
         if self.calls > (
@@ -162,6 +186,8 @@ class ConsultationNodes:
                 "type": "model",
                 "model": usage.get("model"),
                 "purpose": usage.get("purpose", purpose),
+                "attempts": usage.get("attempts", 1),
+                "fallback_from": usage.get("fallback_from"),
                 "summary": "调用模型整理需求",
                 "duration_ms": round((monotonic() - started) * 1000),
                 "tokens": {"total_tokens": used},
@@ -171,7 +197,14 @@ class ConsultationNodes:
 
     async def extract(self, flow):
         self.decision = DraftDecision()
-        if self.options.get("intent") == "draft" or is_draft_command(self.prompt):
+        if (
+            self.options.get("intent") == "draft"
+            or is_draft_command(self.prompt)
+            or (
+                draft_revision_requested(self.prompt)
+                and valid_draft_request(self.prompt, self.prompt)
+            )
+        ):
             if str(self.principal.account.id) != self.snapshot["project"]["owner_id"]:
                 raise ProjectError("FORBIDDEN", "请由客户决定是否整理需求草案", 403)
             self.extraction = Extraction(
@@ -201,13 +234,25 @@ class ConsultationNodes:
                 "has_draft": any(row["kind"] == "specification" for row in self.snapshot["items"]),
                 "draft_paused": self.state.draft_paused,
                 "memory_pending": self.state.memory_pending or not bool(self.notes),
+                "record_retry": getattr(self, "record_retried", False),
             }
             web_enabled = (
                 self.options.get("web_search")
                 and (await ToolStore(self.store.database).get(self.principal))["enabled"]
             )
+            record_required = self.state.memory_pending or bool(
+                re.search(r"纠正|更正|改用|首期|我们|公司|员工|我负责|希望|不能|必须", self.prompt)
+            )
+            choice = (
+                {"type": "function", "function": {"name": "record_consultation"}}
+                if record_required
+                else None
+            )
             message = await self.model(
-                ADVISE, data, tools=[tool, PUBLIC_TOPIC_TOOL] if web_enabled else [tool]
+                ADVISE,
+                data,
+                tools=[tool, PUBLIC_TOPIC_TOOL] if web_enabled else [tool],
+                tool_choice="required" if web_enabled and record_required else choice,
             )
             web_calls = [
                 call
@@ -249,6 +294,7 @@ class ConsultationNodes:
                     ADVISE,
                     {**data, "public_references": references, "research_done": True},
                     tools=[tool],
+                    tool_choice=choice,
                 )
             reply = message.get("content") or ""
             if not isinstance(reply, str):
@@ -282,15 +328,27 @@ class ConsultationNodes:
                             ("draft_request_quote", "request_quote"),
                             ("cancel_draft_quote", "pause_quote"),
                         ):
+                            invalid_quote = False
                             quote = getattr(self.extraction, key)
-                            if quote and quote not in self.prompt:
+                            if quote and (
+                                quote not in self.prompt
+                                or key == "draft_request_quote"
+                                and not valid_draft_request(quote, self.prompt)
+                            ):
                                 setattr(self.extraction, key, "")
+                                invalid_quote = True
                             candidate = getattr(self.decision, target)
-                            if candidate and candidate not in self.prompt:
+                            if candidate and (
+                                candidate not in self.prompt
+                                or target == "request_quote"
+                                and not valid_draft_request(candidate, self.prompt)
+                            ):
                                 setattr(self.decision, target, "")
+                                invalid_quote = True
+                            if invalid_quote:
                                 await self.event(
                                     "assess",
-                                    "未采纳缺少原话依据的操作意愿",
+                                    "未采纳未明确要求生成需求书的操作意愿",
                                     ok=False,
                                     code="CONTROL_QUOTE_INVALID",
                                 )
@@ -313,7 +371,14 @@ class ConsultationNodes:
                         else:
                             self.notes = merge_discovery(self.notes, patch)
                             self.patches.append(patch)
-                            self.state.sources = [*self.state.sources, *sources][-100:]
+                            removed = patch.get("remove_facts", {})
+                            retained = [
+                                s
+                                for s in self.state.sources
+                                if s.value not in removed.get(s.field, [])
+                            ]
+                            active = [s for s in sources if s.value not in removed.get(s.field, [])]
+                            self.state.sources = [*retained, *active][-100:]
                             if any(
                                 key != "open_questions" and value for key, value in patch.items()
                             ):
@@ -346,6 +411,10 @@ class ConsultationNodes:
                         "summary": "已整理本次业务信息" if ok else "业务纪要暂未更新，保留原有信息",
                     },
                 )
+                if not ok and not getattr(self, "record_retried", False):
+                    self.record_retried = True
+                    await self.event("extract", "正在核对本次业务记录")
+                    return await self.extract(flow)
                 # Only one record update is accepted per response.
                 break
             if not reply.strip() or len(reply) > 900 or reply.lstrip().startswith(("{", "[")):
@@ -380,6 +449,10 @@ class ConsultationNodes:
                             "本次沟通已保留，顾问回复暂未完成。"
                             "您可以继续补充，无需重复提供这些信息。"
                         )
+            reply, questions = self.public_reply(reply)
+            if not reply:
+                reply = "您的说明已保留，我们可以接着讨论您关心的内容。"
+            self.state.asked_questions = [*self.state.asked_questions, *questions][-30:]
             if self.state.memory_pending:
                 reply += "\n\n本次原话已保留，业务纪要还有内容未能更新，后续沟通时会继续核对。"
             self.extraction.reply = reply
@@ -411,8 +484,8 @@ class ConsultationNodes:
         requested = bool(
             self.options.get("intent") == "draft"
             or is_draft_command(self.prompt)
-            or self.extraction.draft_request_quote
-            or self.decision.request_quote
+            or valid_draft_request(self.extraction.draft_request_quote, self.prompt)
+            or valid_draft_request(self.decision.request_quote, self.prompt)
         )
         if requested and str(self.principal.account.id) != self.snapshot["project"]["owner_id"]:
             raise ProjectError("FORBIDDEN", "请由客户决定是否整理需求草案", 403)
@@ -465,6 +538,7 @@ class ConsultationNodes:
             )
             return {}
         self.drafts = [result["document"]]
+        self.replacement = result.get("replacement")
         self.state.status, self.state.draft_consent = "draft_ready", False
         self.answer = (
             "已根据保存的业务信息整理并保存一份初稿，详细说明暂未全部生成，待完善处已注明。"
@@ -474,6 +548,8 @@ class ConsultationNodes:
                 "未确定的细节放在待确认事项中，不影响先查看方案。"
             )
         ) + "您可以在“需求草案”中查看、修改；目前尚未立项或发布。"
+        if self.replacement:
+            self.answer = "已在当前草案中补写指定章节，其他章节保留；请查看最新草案。"
         return {}
 
     async def wait_user(self, flow):
@@ -497,6 +573,7 @@ class ConsultationNodes:
             expected_version=self.expected_version,
             defer_completion=True,
             continue_discussion=self.discussion_saved,
+            replacement=self.replacement,
         )
         return {}
 
@@ -517,8 +594,10 @@ class ConsultationNodes:
         self.rounds, self.tokens, self.calls = 0, 0, 0
         self.patches, self.drafts = [], []
         self.extraction = None
+        self.record_retried = False
         self.answer = ""
         self.discussion_saved = False
+        self.replacement = None
         self.notes = self.snapshot["project"]["discovery"]
         self.state = ConsultationState.model_validate(
             self.snapshot["project"].get("consultation") or {}
@@ -527,29 +606,36 @@ class ConsultationNodes:
         return {"route": "extract"}
 
     def checkpoint_payload(self):
-        return {
-            "run_id": str(self.run_id),
-            "prompt": self.prompt,
-            "options": self.options,
-            "notes": self.notes,
-            "state": self.state.model_dump(mode="json"),
-            "patches": self.patches,
-            "drafts": self.drafts,
-            "rounds": self.rounds,
-            "tokens": self.tokens,
-            "calls": self.calls,
-            "extraction": self.extraction.model_dump(exclude_unset=True)
-            if self.extraction
-            else None,
-            "answer": self.answer,
-            "decision": self.decision.model_dump(),
-            "discussion_saved": self.discussion_saved,
-            "expected_version": self.expected_version,
-        }
+        return ConsultationPayload.model_validate(
+            {
+                "run_id": str(self.run_id),
+                "prompt": self.prompt,
+                "options": self.options,
+                "notes": self.notes,
+                "state": self.state.model_dump(mode="json"),
+                "patches": self.patches,
+                "drafts": self.drafts,
+                "replacement": self.replacement,
+                "rounds": self.rounds,
+                "tokens": self.tokens,
+                "calls": self.calls,
+                "record_retried": self.record_retried,
+                "extraction": self.extraction.model_dump(exclude_unset=True)
+                if self.extraction
+                else None,
+                "answer": self.answer,
+                "decision": self.decision.model_dump(),
+                "discussion_saved": self.discussion_saved,
+                "expected_version": self.expected_version,
+            }
+        ).model_dump(mode="json", exclude_unset=True)
 
     def restore(self, payload):
         if not payload:
             return
+        payload = ConsultationPayload.model_validate(payload).model_dump(
+            mode="json", exclude_unset=True
+        )
         for field in (
             "prompt",
             "options",
@@ -563,6 +649,8 @@ class ConsultationNodes:
         ):
             setattr(self, field, payload[field])
         self.decision = DraftDecision.model_validate(payload.get("decision") or {})
+        self.record_retried = payload.get("record_retried", False)
+        self.replacement = payload.get("replacement")
         self.discussion_saved = payload.get("discussion_saved", False)
         self.expected_version = payload.get("expected_version", self.snapshot["project"]["version"])
         self.run_id = UUID(payload["run_id"])
@@ -575,6 +663,122 @@ class ConsultationNodes:
         async def invoke(flow):
             self.restore(flow.get("payload"))
             result = await getattr(self, name)(flow)
+            if name == "persist":
+                # The committed document lives in PG; waiting does not need another full copy.
+                self.patches, self.drafts = [], []
+                self.extraction, self.replacement = None, None
+                self.answer = ""
+                self.decision = DraftDecision()
             return {**result, "payload": self.checkpoint_payload()}
 
         return invoke
+
+
+class FactNodes(ConsultationNodes):
+    """Silent customer-fact branch; no reply, draft, search or approval tool is exposed."""
+
+    def __init__(self, agent, store, principal, project_id, job):
+        snapshot = {
+            "project": job["project"],
+            "messages": job["messages"],
+            "runs": [],
+            "items": [],
+            "baseline": None,
+        }
+        super().__init__(agent, store, principal, project_id, UUID(job["run_id"]), snapshot)
+        self.job, self.silent, self.prompt, self.options = job, True, "", {}
+
+    async def extract_facts(self, state):
+        from backend.agents.consultation.prompts import EXTRACT_FACTS
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "record_consultation",
+                "description": "静默整理客户新说明，不回复、不生成文档。",
+                "parameters": ConsultationRecord.model_json_schema(),
+            },
+        }
+        data = {
+            "previous": self.notes,
+            "customer_messages": [
+                {"id": row["id"], "content": row["content"]} for row in self.job["messages"]
+            ],
+            "source_catalog": source_catalog("", self.run_id, self.job["messages"]),
+        }
+        for attempt in range(2):
+            message = await self.model(
+                EXTRACT_FACTS,
+                {**data, "record_retry": bool(attempt)},
+                tools=[tool],
+                tool_choice={"type": "function", "function": {"name": "record_consultation"}},
+            )
+            try:
+                call = next(
+                    c
+                    for c in message.get("tool_calls", [])
+                    if c.get("function", {}).get("name") == "record_consultation"
+                )
+                record = ConsultationRecord.model_validate_json(call["function"]["arguments"])
+                repeated = [
+                    fact
+                    for fact in record.facts
+                    if self.notes.get(fact.field) == fact.value
+                    or isinstance(self.notes.get(fact.field), list)
+                    and fact.value in self.notes[fact.field]
+                ]
+                if record.facts and len(repeated) == len(record.facts) and not record.remove_facts:
+                    raise ValueError("EXISTING_FACTS_ONLY")
+                record.facts = [fact for fact in record.facts if fact not in repeated]
+                extraction = record.turn()
+                extraction.draft_request_quote = extraction.cancel_draft_quote = ""
+                patch, sources = verified_patch(
+                    extraction,
+                    "",
+                    self.run_id,
+                    self.notes,
+                    self.job["messages"],
+                    current_message_ids={row["id"] for row in self.job["messages"]},
+                )
+                return {"patch": patch, "sources": [s.model_dump(mode="json") for s in sources]}
+            except (StopIteration, ValueError, KeyError, TypeError) as error:
+                data["record_errors"] = (
+                    [
+                        {"field": list(item["loc"]), "type": item["type"]}
+                        for item in error.errors(include_input=False, include_url=False)
+                    ]
+                    if isinstance(error, ValidationError)
+                    else [
+                        {
+                            "type": type(error).__name__,
+                            "reason": (
+                                "只重复旧纪要：请重新阅读本批原话，提取尚未记录的新规则；"
+                                "确实没有新事实才返回空facts，不要把旧事实错误挂到新消息。"
+                                if str(error) == "EXISTING_FACTS_ONLY"
+                                else "核对field、value与真实source_id"
+                            ),
+                        }
+                    ]
+                )
+                logger.warning(
+                    "silent_record_invalid run_id=%s attempt=%s error_type=%s",
+                    self.run_id,
+                    attempt + 1,
+                    type(error).__name__,
+                )
+                if attempt:
+                    raise ProjectError(
+                        "FACT_EXTRACTION_INVALID", "客户信息待继续整理，聊天记录已保存", 503
+                    ) from None
+
+    async def persist_facts(self, state):
+        from backend.models.consultation import FactSource
+
+        await self.store.finish_facts(
+            self.principal,
+            self.project_id,
+            self.job,
+            state["patch"],
+            [FactSource.model_validate(s) for s in state["sources"]],
+        )
+        return {"patch": {}, "sources": []}

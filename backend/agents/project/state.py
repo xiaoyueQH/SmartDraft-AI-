@@ -8,3 +8,5 @@ class GraphState(TypedDict):
     pending: list[dict]
     answer: str
     tokens: int
+    drafts: list[dict]
+    notes: list[dict]

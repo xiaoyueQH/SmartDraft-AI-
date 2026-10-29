@@ -23,10 +23,16 @@ class DraftNodes:
 
     def remaining(self):
         settings = self.flow.agent.settings
+        tokens = max(0, settings.draft_token_budget - self.flow.tokens)
         return {
             "model_calls": max(0, settings.draft_max_rounds - self.flow.rounds),
             "tool_calls": max(0, settings.draft_max_tools - self.flow.calls),
-            "tokens": max(0, settings.draft_token_budget - self.flow.tokens),
+            "tokens": tokens,
+            "missing_sections": [s.model_dump() for s in self.missing()],
+            "estimated_writer_capacity": min(
+                max(0, settings.draft_max_rounds - self.flow.rounds),
+                tokens // 12000,
+            ),
             "finalization_available": not self.state.finalization_attempted,
             "seconds": max(0, round(self.deadline - asyncio.get_running_loop().time(), 1)),
         }
@@ -51,6 +57,16 @@ class DraftNodes:
         return [s for s in self.state.plan.sections if s.id not in self.state.sections]
 
     def assemble(self):
+        if self.state.original_blocks:
+            parts = []
+            for block in self.state.original_blocks:
+                body = self.state.sections.get(block["id"])
+                if body is None:
+                    parts.append(block["content"])
+                else:
+                    heading = block["content"].splitlines()[0]
+                    parts.append(heading + "\n\n" + body.strip() + "\n\n")
+            return "".join(parts)
         if self.state.direct_body:
             return self.state.direct_body
         if not self.state.sections and not self.state.plan:
@@ -139,12 +155,14 @@ class DraftNodes:
             tools=runtime.toolset.schemas(data["web_enabled"]),
             conversation=state.observations(),
             count_native_tools=False,
-            output_limit=6000,
+            output_limit=2500,
         )
         calls = message.get("tool_calls") or []
         if not calls:
-            if not state.sections:
+            if not state.sections and not state.original_blocks:
                 state.direct_body = markdown(message, document=True)
+            if state.original_blocks and not state.sections:
+                raise ProjectError("DRAFT_REVISION_EMPTY", "没有完成章节补写，原稿保持不变", 503)
             runtime.complete()
             return {"pending": []}
         # The graph checkpoints each tool observation, including a batch selected in one decision.

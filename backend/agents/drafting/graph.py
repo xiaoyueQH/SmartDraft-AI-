@@ -6,12 +6,13 @@ import time
 from langgraph.errors import NodeCancelledError
 from langgraph.graph import END, START, StateGraph
 
-from backend.agents.common import tool_json
+from backend.agents.common import draft_revision_requested, tool_json
 from backend.agents.drafting.nodes import DraftNodes
 from backend.agents.drafting.state import DraftState, GraphState
 from backend.db.checkpoints import DatabaseCheckpointer
 from backend.db.tool_store import ToolStore
 from backend.models.projects import DraftItem, ProjectError
+from backend.models.review import split_markdown
 
 
 def after_tools(state):
@@ -60,6 +61,8 @@ async def invoke_graph(nodes, checkpointer):
                 "notes": state.business_notes,
                 "quotes": state.customer_statements,
                 "request": state.user_request,
+                "replacement": state.replacement,
+                "original_blocks": state.original_blocks,
                 "options": flow.options,
                 "references": [ref.model_dump(mode="json") for ref in state.references],
                 "previous_assumptions": [
@@ -159,9 +162,9 @@ async def create_draft(flow, *, checkpointer=None):
         flow.snapshot["project"]["version"],
         flow.agent.settings.draft_history_chars,
     )
-    quotes = list(dict.fromkeys(source.quote for source in flow.state.sources if source.quote))
-    if not notes or flow.state.memory_pending:
-        quotes = list(dict.fromkeys(row["content"] for row in rows if row["role"] == "user"))
+    quotes = list(
+        reversed(dict.fromkeys(row["content"] for row in reversed(rows) if row["role"] == "user"))
+    )
     if not notes and not quotes:
         raise ProjectError(
             "BUSINESS_CONTEXT_REQUIRED", "还没有可整理的业务信息，请先简单说说想做什么", 422
@@ -186,11 +189,67 @@ async def create_draft(flow, *, checkpointer=None):
             )
         ],
     ).model_copy(deep=True)
+    if draft_revision_requested(draft_state.user_request):
+        original = await flow.store.draft_target(
+            flow.principal, flow.project_id, flow.snapshot["project"]["version"]
+        )
+        if original is None:
+            raise ProjectError(
+                "DRAFT_REVISION_MISSING", "没有可以补写的草稿；正式版本请通过需求变更处理", 409
+            )
+        draft_state.original_blocks = split_markdown(original["content"])
+        for block in draft_state.original_blocks:
+            block["id"] = f"existing-{block['position'] + 1}"
+        draft_state.original_questions = list(original["questions"])
+        draft_state.replacement = {
+            "id": original["id"],
+            "version": original["version"],
+            "title": original["title"],
+        }
     nodes = DraftNodes(flow, draft_state)
     body, partial = await run_graph(nodes, checkpointer=checkpointer)
+    if (
+        partial
+        and not draft_state.original_blocks
+        and await flow.store.draft_target(
+            flow.principal, flow.project_id, flow.snapshot["project"]["version"]
+        )
+    ):
+        raise ProjectError("DRAFT_REGEN_INCOMPLETE", "本次重新生成未完成，最新草案保持不变", 503)
     flow.state.references = draft_state.references
     if draft_state.assumptions and (draft_state.sections or draft_state.direct_body):
         flow.state.draft_assumptions = draft_state.assumptions
+    if draft_state.original_blocks:
+        if not draft_state.sections:
+            raise ProjectError("DRAFT_REVISION_EMPTY", "没有完成章节补写，原稿保持不变", 503)
+        revised_titles = [
+            b["title"] for b in draft_state.original_blocks if b["id"] in draft_state.sections
+        ]
+        questions = [
+            q
+            for q in draft_state.original_questions
+            if not any(title in q and "章节尚需补充细节" in q for title in revised_titles)
+        ]
+        questions = list(dict.fromkeys([*questions, *draft_state.questions]))
+        for title in revised_titles:
+            body = body.replace(f"- “{title}”章节尚需补充细节。", "")
+        if "本章暂未生成" not in body:
+            questions = [q for q in questions if q != "详细功能、异常处理和验收方式尚需完善。"]
+            body = body.replace("- 详细功能、异常处理和验收方式尚需完善。", "")
+        body = re.sub(r"(^## 待确认事项\s*\n)\s*(?=^## |\Z)", r"\1\n暂无\n\n", body, flags=re.M)
+        partial = partial or "本章暂未生成" in body
+        document = DraftItem(
+            kind="specification",
+            title=draft_state.replacement["title"],
+            content=body,
+            questions=questions,
+        )
+        await flow.event("draft_complete", "已补写指定章节，其他内容保持不变")
+        return {
+            "document": document.model_dump(),
+            "partial": partial,
+            "replacement": draft_state.replacement,
+        }
     body = (
         "本草案根据客户要求和自动补充方案整理，尚未立项。"
         "用户未明确选择的设计属于【自动生成】方案，可调整，不代表用户已选择或确认；"
@@ -203,7 +262,7 @@ async def create_draft(flow, *, checkpointer=None):
             for item in draft_state.assumptions
         )
     if notes:
-        body += "\n\n" + saved_notes(notes)
+        body += "\n\n" + saved_notes(draft_state.context()["business_notes"])
     elif quotes:
         body += "\n\n## 客户原话\n\n" + "\n\n".join(quotes)
     questions = pending_questions(

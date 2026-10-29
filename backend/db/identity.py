@@ -14,7 +14,12 @@ async def lock_identity(
     if session.get_bind().dialect.name == "postgresql":
         await session.execute(text("SET LOCAL lock_timeout = '1500ms'"))
     user = await session.scalar(
-        select(User).where(User.id == principal.account.id).with_for_update(read=shared)
+        select(User)
+        .where(User.id == principal.account.id)
+        # Business writes serialize by actor without blocking FK KEY SHARE checks from
+        # another project's transaction. Full UPDATE here can deadlock a background
+        # project update with this actor waiting for that same project row.
+        .with_for_update(read=shared, key_share=not shared)
     )
     login = await session.scalar(
         select(LoginSession)

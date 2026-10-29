@@ -124,17 +124,44 @@ export class SessionClient {
     const signals = [AbortSignal.timeout(streaming ? 35000 : 10000)];
     if (useCurrentSignal) signals.push(this.controller.signal);
     if (init.signal) signals.push(init.signal);
-    return this.fetcher(path, {
-      ...init,
-      headers,
-      credentials: "same-origin",
-      cache: "no-store",
-      signal: AbortSignal.any(signals),
-    });
+    try {
+      return await this.fetcher(path, {
+        ...init,
+        headers,
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: AbortSignal.any(signals),
+      });
+    } catch (error) {
+      if (
+        error instanceof TypeError ||
+        (error instanceof Error && error.name === "TimeoutError")
+      )
+        throw new ApiError(
+          "连接暂时中断，请稍后重试原操作",
+          0,
+          "NETWORK_UNAVAILABLE",
+        );
+      throw error;
+    }
   }
 
   private async read<T>(response: Response, version: number): Promise<T> {
-    const body = response.status === 204 ? null : await response.json();
+    let body;
+    try {
+      body = response.status === 204 ? null : await response.json();
+    } catch {
+      this.assertCurrent(version);
+      throw new ApiError(
+        response.ok
+          ? "服务返回内容不完整，请重试原操作"
+          : "服务暂时不可用，请稍后重试原操作",
+        // A successful response without its receipt has an unknown write outcome.
+        // Keep the original request available for retry instead of creating another.
+        response.ok ? 0 : response.status,
+        response.ok ? "RESPONSE_INVALID" : "REQUEST_FAILED",
+      );
+    }
     this.assertCurrent(version);
     if (!response.ok)
       throw new ApiError(
@@ -296,7 +323,10 @@ export class SessionClient {
         Boolean(onFrame),
       );
       if (response.status === 401) {
-        const errorBody = await response.clone().json();
+        const errorBody = await response
+          .clone()
+          .json()
+          .catch(() => null);
         this.assertCurrent(version);
         if (errorBody?.error?.code === "ACCESS_EXPIRED") {
           if (sentToken === this.accessToken) await this.refresh();

@@ -1,5 +1,7 @@
+from datetime import UTC, datetime, timedelta
+
 from langgraph.checkpoint.base import WRITES_IDX_MAP, BaseCheckpointSaver, CheckpointTuple
-from sqlalchemy import delete, select
+from sqlalchemy import String, cast, delete, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -7,6 +9,81 @@ from backend.models.consultation import GraphCheckpoint, GraphWrite
 
 
 class DatabaseCheckpointer(BaseCheckpointSaver):
+    async def cleanup_terminal(self, *, limit=25, success_days=1, failure_days=7):
+        """Bounded housekeeping, never delete a waiting or currently executing thread."""
+        from backend.models.projects import ProjectOperation, ProjectRun
+        from backend.models.review import DocumentReview
+
+        cutoff = datetime.now(UTC) - timedelta(days=success_days)
+        failure_cutoff = datetime.now(UTC) - timedelta(days=failure_days)
+        async with self.database.session() as session:
+            runs = list(
+                await session.scalars(
+                    select(ProjectRun.id)
+                    .where(
+                        ProjectRun.project_id == self.project_id,
+                        or_(
+                            (ProjectRun.status == "completed") & (ProjectRun.created_at < cutoff),
+                            (ProjectRun.status == "failed")
+                            & (ProjectRun.created_at < failure_cutoff),
+                        ),
+                        select(GraphCheckpoint.checkpoint_id)
+                        .where(
+                            GraphCheckpoint.project_id == self.project_id,
+                            func.replace(GraphCheckpoint.thread_id, "-", "")
+                            == literal("draft:")
+                            + func.replace(cast(ProjectRun.id, String), "-", ""),
+                        )
+                        .exists(),
+                    )
+                    .order_by(ProjectRun.created_at)
+                    .limit(limit)
+                )
+            )
+            reviews = list(
+                await session.scalars(
+                    select(DocumentReview.id)
+                    .where(
+                        DocumentReview.project_id == self.project_id,
+                        ~select(ProjectOperation.id)
+                        .where(
+                            ProjectOperation.project_id == self.project_id,
+                            ProjectOperation.created_at >= cutoff,
+                            func.replace(
+                                ProjectOperation.result["review"]["id"].as_string(), "-", ""
+                            )
+                            == func.replace(cast(DocumentReview.id, String), "-", ""),
+                        )
+                        .exists(),
+                        or_(
+                            DocumentReview.status.in_(["applied", "discarded"])
+                            & (DocumentReview.created_at < cutoff),
+                            (DocumentReview.status == "failed")
+                            & (DocumentReview.created_at < failure_cutoff),
+                        ),
+                        select(GraphCheckpoint.checkpoint_id)
+                        .where(
+                            GraphCheckpoint.project_id == self.project_id,
+                            func.replace(GraphCheckpoint.thread_id, "-", "")
+                            == literal("review:")
+                            + func.replace(cast(DocumentReview.id, String), "-", ""),
+                        )
+                        .exists(),
+                    )
+                    .order_by(DocumentReview.created_at)
+                    .limit(limit)
+                )
+            )
+            threads = [*(f"draft:{rid}" for rid in runs), *(f"review:{rid}" for rid in reviews)]
+            if threads:
+                for model in (GraphWrite, GraphCheckpoint):
+                    await session.execute(
+                        delete(model).where(
+                            model.project_id == self.project_id, model.thread_id.in_(threads)
+                        )
+                    )
+            return len(threads)
+
     """Project-scoped LangGraph persistence on the existing asynchronous session pool."""
 
     def __init__(self, database, project_id):

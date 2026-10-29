@@ -6,6 +6,11 @@ import {
   kindLabels,
   stateLabels,
   itemStateLabel,
+  supportReasonLabels,
+  supportNextStep,
+  type SupportInbox,
+  type SupportReason,
+  type SupportRequest,
   type Project,
   type ProjectItem,
 } from "../api/projects";
@@ -76,6 +81,18 @@ const rows = ref<(ManagedProject | ManagedItem)[]>([]),
 const manager = ref<InstanceType<typeof RecordManager> | null>(null),
   creator = ref<InstanceType<typeof NewConsultation> | null>(null);
 const controller = new AbortController();
+const supportRows = ref<SupportRequest[]>([]),
+  supportCounts = ref<Partial<SupportInbox["counts"]>>({}),
+  supportReason = ref<SupportReason | "">(""),
+  supportQuery = ref(""),
+  appliedSupportQuery = ref(""),
+  supportOffset = ref(0),
+  supportMore = ref(false),
+  supportLoading = ref(false),
+  supportNotice = ref(""),
+  supportCheckedAt = ref("");
+let supportGeneration = 0,
+  supportTimer: ReturnType<typeof setTimeout> | null = null;
 let generation = 0,
   disposed = false;
 const cards = [
@@ -160,6 +177,64 @@ async function load(page = 0) {
     if (!disposed && current === generation) loading.value = false;
   }
 }
+async function loadSupport(page = 0) {
+  if (supportTimer) clearTimeout(supportTimer);
+  const current = ++supportGeneration;
+  supportLoading.value = true;
+  supportNotice.value = "";
+  const params = new URLSearchParams({
+    scope: "all",
+    reason: supportReason.value,
+    q: appliedSupportQuery.value,
+    offset: String(page),
+    limit: "10",
+  });
+  try {
+    const result = await auth.request<SupportInbox>(
+      `/api/conversations/requests?${params}`,
+      { signal: controller.signal },
+    );
+    if (
+      disposed ||
+      current !== supportGeneration ||
+      props.section !== "overview"
+    )
+      return;
+    supportRows.value = result.items;
+    supportCounts.value = result.counts ?? {};
+    supportMore.value = result.has_more;
+    supportOffset.value = page;
+    supportCheckedAt.value = result.checked_at;
+    if (!result.items.length && page > 0) await loadSupport(0);
+  } catch (error) {
+    if (!disposed && current === supportGeneration) {
+      supportRows.value = [];
+      supportCounts.value = {};
+      supportMore.value = false;
+      supportNotice.value =
+        error instanceof Error ? error.message : "接待列表读取失败，请重新查询";
+    }
+  } finally {
+    if (
+      !disposed &&
+      current === supportGeneration &&
+      props.section === "overview"
+    ) {
+      supportLoading.value = false;
+      supportTimer = setTimeout(
+        () => void loadSupport(supportOffset.value),
+        15000,
+      );
+    }
+  }
+}
+function searchSupport() {
+  appliedSupportQuery.value = supportQuery.value.trim();
+  void loadSupport();
+}
+function supportTime(value: string | null) {
+  return value ? new Date(value).toLocaleString() : "—";
+}
 function search() {
   appliedQuery.value = query.value.trim();
   void load();
@@ -194,6 +269,10 @@ watch(
     appliedQuery.value = "";
     phase.value = props.initialPhase;
     status.value = props.section === "reviews" ? "pending_review" : "active";
+    supportGeneration++;
+    if (supportTimer) clearTimeout(supportTimer);
+    supportTimer = null;
+    if (props.section === "overview") void loadSupport();
     void load();
   },
   { immediate: true },
@@ -202,6 +281,8 @@ onBeforeRouteLeave(() => !(recordBusy.value || creator.value?.busy()));
 onUnmounted(() => {
   disposed = true;
   generation++;
+  supportGeneration++;
+  if (supportTimer) clearTimeout(supportTimer);
   controller.abort();
 });
 </script>
@@ -245,6 +326,126 @@ onUnmounted(() => {
         ><small>查看列表 →</small>
       </button>
     </div>
+    <section
+      v-if="section === 'overview'"
+      class="management-table-panel support-inbox"
+      aria-label="待处理接待"
+      :aria-busy="supportLoading"
+    >
+      <div class="support-heading">
+        <h2>待处理接待</h2>
+        <span>全部原因共 {{ supportCounts.total ?? "—" }} 条 · 每15秒更新</span>
+      </div>
+      <p class="support-description">
+        查看等待原因、接待人和到期时间。同一项目可有多个原因；客户只等人工时不会自动恢复AI。
+      </p>
+      <form class="management-filters" @submit.prevent="searchSupport">
+        <label
+          >客户或项目<input
+            v-model="supportQuery"
+            maxlength="80"
+            placeholder="搜索客户或项目名称"
+        /></label>
+        <label
+          >待处理原因<select v-model="supportReason">
+            <option value="">全部原因</option>
+            <option
+              v-for="(label, reason) in supportReasonLabels"
+              :key="reason"
+              :value="reason"
+            >
+              {{ label }}（{{ supportCounts[reason] ?? "—" }}）
+            </option>
+          </select></label
+        >
+        <button class="button button-outline" :disabled="supportLoading">
+          查询接待
+        </button>
+      </form>
+      <p v-if="supportNotice" class="notice notice-warning" role="alert">
+        {{ supportNotice
+        }}<button class="text-button" @click="loadSupport(supportOffset)">
+          重新读取接待
+        </button>
+      </p>
+      <div class="table-scroll">
+        <table class="management-table">
+          <thead>
+            <tr>
+              <th>客户 / 项目</th>
+              <th>等待原因</th>
+              <th>接待人</th>
+              <th>到期时间</th>
+              <th>处理建议</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in supportRows" :key="item.id">
+              <td>
+                <strong>{{ item.customer_name }}</strong
+                ><small>{{ item.title }}</small>
+              </td>
+              <td>
+                <span
+                  v-for="reason in item.reasons"
+                  :key="reason"
+                  class="support-reason"
+                  :class="{ urgent: ['failed', 'expiring'].includes(reason) }"
+                  >{{ supportReasonLabels[reason] }}</span
+                ><small v-if="item.failure_summary">{{
+                  item.failure_summary
+                }}</small>
+              </td>
+              <td>{{ item.support_name || "尚未领取" }}</td>
+              <td>
+                {{
+                  item.human_only
+                    ? "只等人工，不自动切换"
+                    : item.conversation_mode === "pending"
+                      ? "本轮处理结束后开始计时"
+                      : supportTime(item.deadline_at)
+                }}
+              </td>
+              <td>{{ supportNextStep(item) }}</td>
+              <td>
+                <button
+                  class="text-button"
+                  :disabled="supportLoading"
+                  @click="router.push(`/admin/projects/${item.id}`)"
+                >
+                  查看并处理
+                </button>
+              </td>
+            </tr>
+            <tr v-if="!supportRows.length && !supportNotice">
+              <td colspan="6">
+                {{
+                  supportLoading ? "正在读取接待…" : "当前条件下暂无待处理接待"
+                }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pagination">
+        <button
+          class="button button-outline"
+          :disabled="supportLoading || supportOffset === 0"
+          @click="loadSupport(supportOffset - 10)"
+        >
+          接待上一页</button
+        ><button
+          class="button button-outline"
+          :disabled="supportLoading || !supportMore"
+          @click="loadSupport(supportOffset + 10)"
+        >
+          接待下一页</button
+        ><small v-if="supportCheckedAt"
+          >更新于 {{ supportTime(supportCheckedAt) }}</small
+        >
+      </div>
+    </section>
     <section class="management-table-panel">
       <h2>
         {{ section === "overview" ? "最近客户记录" : config.title + "列表" }}
@@ -367,3 +568,46 @@ onUnmounted(() => {
     <NewConsultation ref="creator" @created="created" />
   </section>
 </template>
+
+<style scoped>
+.support-inbox {
+  margin-bottom: 24px;
+}
+.support-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.support-heading span,
+.support-description,
+.pagination small {
+  color: #64748b;
+  font-size: 13px;
+}
+.support-reason {
+  display: inline-block;
+  margin: 3px 5px 3px 0;
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: #edf3fa;
+  color: #365b87;
+  font-size: 12px;
+}
+.support-reason.urgent {
+  background: #fff2dc;
+  color: #86540d;
+}
+.support-inbox td {
+  min-width: 110px;
+}
+.support-inbox td:first-child,
+.support-inbox td:nth-child(5) {
+  min-width: 180px;
+}
+.support-inbox td small {
+  display: block;
+  margin-top: 5px;
+}
+</style>

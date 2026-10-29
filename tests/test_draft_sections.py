@@ -63,13 +63,19 @@ class AgentFlow:
         )
         self.principal, self.project_id, self.run_id = "owner", "project", "run"
         self.store = SimpleNamespace(
-            database=None, draft_history=self.history, event=self.event_record
+            database=None,
+            draft_history=self.history,
+            event=self.event_record,
+            draft_target=self.target,
         )
         self.models, self.events, self.script, self.section_writes = [], [], list(script), []
         self.fail_section = fail_section
 
     async def history(self, *args):
         return []
+
+    async def target(self, *args):
+        return None
 
     async def event_record(self, run_id, event):
         self.events.append(event)
@@ -463,6 +469,11 @@ async def test_explicit_customer_stack_removes_old_auto_technology_from_context(
         DraftAssumption(category="operations", topic="邮件实现", value="Node.js Nodemailer"),
     ]
     flow.notes["technology_preference"] = "Java和Spring Boot"
+
+    async def customer_history(*args):
+        return [{"role": "user", "content": "技术选型我明确选择Java和Spring Boot"}]
+
+    flow.store.draft_history = customer_history
     result = await create_draft(flow, checkpointer=InMemorySaver())
     assert not result["partial"]
     context = flow.models[0][1]
@@ -471,3 +482,148 @@ async def test_explicit_customer_stack_removes_old_auto_technology_from_context(
     assert "Python FastAPI" not in result["document"]["content"]
     facts = result["document"]["content"].split("## 客户已说明的信息", 1)[1]
     assert "Java和Spring Boot" in facts and "【自动生成】" not in facts
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_revision_changes_only_the_requested_existing_chapter(failure):
+    from types import MethodType
+
+    original = (
+        "# 草案\n\n## 业务规则\n必须提前2小时；原细节与列表全部保留。\n\n"
+        "## 技术部署\n> 本章暂未生成，请补充细节。\n\n"
+        "## 验收\n取消后释放；原验收条目保持不变。"
+    )
+    flow = AgentFlow()
+    flow.prompt = "请把草案里技术部署那一章补齐，然后更新草案。"
+    flow.snapshot["items"] = [
+        {
+            "id": "original",
+            "kind": "specification",
+            "status": "draft",
+            "content": original,
+            "questions": [
+                "“技术部署”章节尚需补充细节。",
+                "实际账号导入方式待客户决定",
+                "详细功能、异常处理和验收方式尚需完善。",
+            ],
+            "title": "会议室草案",
+            "version": 3,
+            "created_at": "2026-10-27",
+        }
+    ]
+    base_model = flow.model
+
+    async def draft_target(*args):
+        return flow.snapshot["items"][0]
+
+    flow.store.draft_target = draft_target
+
+    async def model(self, system, data, **kwargs):
+        if "DRAFT_AGENT" in system:
+            selected = next(b for b in data["existing_sections"] if b["title"] == "技术部署")
+            if failure:
+                self.fail_section = selected["id"]
+            return tools(
+                call("write_prd_section", {"section_id": selected["id"]}), call("finish_draft", {})
+            )
+        return await base_model(system, data, **kwargs)
+
+    flow.model = MethodType(model, flow)
+    if failure:
+        with pytest.raises(ProjectError, match="没有完成章节补写"):
+            await create_draft(flow, checkpointer=InMemorySaver())
+    else:
+        result = await create_draft(flow, checkpointer=InMemorySaver())
+        assert result["replacement"]["id"] == "original"
+        assert result["document"]["content"].startswith(original.split("## 技术部署")[0])
+        assert result["document"]["content"].endswith(original.split("## 验收")[1])
+        assert "> 本章暂未生成" not in result["document"]["content"]
+        assert result["document"]["questions"] == ["实际账号导入方式待客户决定"]
+    assert flow.snapshot["items"][0]["content"] == original
+
+
+def test_written_chapter_context_fits_budget_without_shortening_saved_document():
+    from backend.agents.common import request_budget, tool_json
+    from backend.models.drafting import DraftSection
+    from backend.models.projects import ProjectError
+
+    state = DraftState(business_notes={"subject": "报修系统"})
+    for i in range(3):
+        sid = f"s{i}"
+        state.section_specs[sid] = DraftSection(id=sid, title=f"章节{i}")
+        state.sections[sid] = (
+            "开头权限规则。" + "已保存的详细字段和验收条件。" * 700 + "结尾接口约束。"
+        )
+    full = dict(state.sections)
+    before = state.context(include_written=True)
+    for sid, section in before["written_sections"].items():
+        body = state.sections[sid]
+        section["excerpt"] = body[:400] + "\n…\n" + body[-800:]
+    with pytest.raises(ProjectError, match="剩余用量不足"):
+        request_budget([{"role": "user", "content": tool_json(before)}], False, 9000)
+    after = state.context(include_written=True)
+    _, allowance = request_budget([{"role": "user", "content": tool_json(after)}], False, 9000)
+    assert allowance >= 256
+    assert state.sections == full
+    assert all(
+        "开头权限规则" in s["excerpt"] and "结尾接口约束" in s["excerpt"]
+        for s in after["written_sections"].values()
+    )
+
+
+def test_latest_correction_quarantines_old_technical_constraints_before_drafting():
+    state = DraftState(
+        business_notes={
+            "technology_preference": "Java",
+            "constraints": ["禁止Java和Python", "不收费"],
+        },
+        customer_statements=["使用Java", "纠正：Java和Python只是举例，不是我的选择，技术你推荐。"],
+    )
+    context = state.context()
+    assert "technology_preference" not in context["business_notes"]
+    assert context["business_notes"]["constraints"] == ["不收费"]
+    assert context["unverified_historical_notes"]["constraints"] == ["禁止Java和Python"]
+    assert state.business_notes["technology_preference"] == "Java"
+
+
+async def test_four_chapters_fit_real_input_reservations_and_preserve_detail():
+    from backend.agents.common import request_budget, tool_json
+    from backend.agents.drafting.graph import run_graph
+
+    class BudgetFlow(AgentFlow):
+        async def model(self, system, data, **kwargs):
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "以下为业务数据：" + tool_json(data)},
+            ]
+            messages += kwargs.get("conversation", [])
+            reserve, allowance = request_budget(
+                messages,
+                bool(kwargs.get("tools")),
+                self.agent.settings.draft_token_budget - self.tokens,
+                tools=kwargs.get("tools"),
+                max_output=kwargs.get("output_limit", 4000),
+            )
+            assert allowance >= 1000
+            result = await super().model(system, data, **kwargs)
+            self.tokens += reserve + 1000
+            return result
+
+    specs = [
+        {"id": f"s{i}", "title": title}
+        for i, title in enumerate(("目标权限", "业务功能", "技术部署", "异常验收"))
+    ]
+    flow = BudgetFlow(
+        [
+            tools(call("plan_draft", {"sections": specs})),
+            tools(*(call("write_prd_section", {"section_id": s["id"]}) for s in specs)),
+        ]
+    )
+    flow.agent.settings.draft_max_rounds = 12
+    state = DraftState(
+        business_notes=flow.notes,
+        customer_statements=["员工只看本人记录，技术由你推荐，自动生成方案。"],
+    )
+    body, partial = await run_graph(DraftNodes(flow, state), checkpointer=InMemorySaver())
+    assert not partial and all(s["title"] in body for s in specs)
+    assert len(state.sections) == 4 and "本章暂未生成" not in body

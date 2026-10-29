@@ -211,3 +211,18 @@ async def test_complete_business_lifecycle_with_changes_delivery_support_and_rec
     history = (await client.get(f"/api/projects/{p['id']}/activity", headers=customer)).json()
     assert any(event["note"] == "补充：修改阈值后出现" for event in history)
     assert any(event["action"] == "record:restore" for event in history)
+
+
+async def test_invisible_names_are_rejected_while_unicode_and_emoji_remain_valid(auth_api):
+    client, _, _ = auth_api
+    identity = headers(await login(client))
+    p = await project(client, identity)
+    for title in ["\u200b\u200d", "\u2060\ufeff", "\u0301", " \t\n"]:
+        result = await manage(client, identity, [p], "rename", title=title)
+        assert result.status_code == 422
+        assert (await current(client, identity, p["id"]))["version"] == p["version"]
+    for title in ["设备报修 👨‍👩‍👧", "कंप्यूटर मरम्मत", "e\u0301quipe"]:
+        result = await manage(client, identity, [p], "rename", title=title)
+        assert result.status_code == 200, result.text
+        p = result.json()["items"][0]
+        assert p["title"] == title

@@ -114,13 +114,23 @@ def test_stack_components_and_scalar_replacement_preserve_each_original_source(r
         verified_patch(record.turn(), prompt, "run", {})
 
 
-def test_scalar_removal_without_replacement_is_not_silently_accepted():
+def test_scalar_removal_requires_current_correction_and_clears_the_old_choice():
+    from backend.agents.consultation.state import verified_patch
+    from backend.models.discovery import merge_discovery
+
+    record = ConsultationRecord(
+        remove_facts=[
+            {"field": "technology_preference", "value": "旧平台", "source_id": "current:0"}
+        ]
+    ).turn()
     with pytest.raises(ValueError):
-        ConsultationRecord(
-            remove_facts=[
-                {"field": "technology_preference", "value": "旧平台", "source_id": "current:0"}
-            ]
-        ).turn()
+        verified_patch(record, "继续讨论", "run", {"technology_preference": "旧平台"})
+    patch, _ = verified_patch(
+        record, "纠正：旧平台只是举例，不是我的选择", "run", {"technology_preference": "旧平台"}
+    )
+    assert (
+        merge_discovery({"technology_preference": "旧平台"}, patch)["technology_preference"] == ""
+    )
 
 
 def test_latest_stack_components_override_valid_history_but_unknown_sources_still_fail():
@@ -132,7 +142,7 @@ def test_latest_stack_components_override_valid_history_but_unknown_sources_stil
     ]
     record = ConsultationRecord(
         facts=[
-            {"field": "technology_preference", "value": "Node.js", "source_id": "old-message:0"},
+            {"field": "technology_preference", "value": "Node.js", "source_id": "run:old-run:0"},
             {"field": "technology_preference", "value": "Java", "source_id": "current:0"},
             {"field": "technology_preference", "value": "PostgreSQL", "source_id": "current:0"},
         ]
@@ -333,6 +343,98 @@ async def test_paraphrased_control_quotes_do_not_fail_or_force_drafting(auth_api
     assert len(model.calls) == 1
 
 
+@pytest.mark.parametrize("control_field", ["decision", "draft_request_quote"])
+async def test_verbatim_template_question_is_not_permission_to_generate(
+    auth_api, monkeypatch, control_field
+):
+    client, _, _ = auth_api
+    prompt = (
+        "愿意尝试。我们内部确实重度依赖企业微信，如果能用简道云这种低代码工具在企微里搭一个"
+        "轻量级的工单流转，前期投入不高的话，完全可以先跑个试点。你们有现成的企微+简道云"
+        "（或类似工具）的售后工单模板吗？我们可以先内部测试一下。"
+    )
+    reply = (
+        "可以先参考售后工单的示例字段和流转步骤做小范围试点。"
+        "我没有接入您提到的平台模板库，不能保证有可直接导入的模板。"
+    )
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
+
+    async def complete(self, messages, **kwargs):
+        assert "DRAFT_" not in messages[0]["content"], (
+            "Template discussions must not call the draft agent"
+        )
+        if "CONSULTATION_REPLY" in messages[0]["content"]:
+            return {"content": reply}, {"total_tokens": 50}
+        record = {
+            "notes": {"scope": ["售后工单流转"]},
+            "sources": [{"field": "scope", "value": "售后工单流转", "source_id": "current:0"}],
+            "reply": reply,
+        }
+        if control_field == "decision":
+            record["decision"] = {"request_quote": prompt}
+        else:
+            record["draft_request_quote"] = prompt
+        return {
+            "content": reply,
+            "tool_calls": [
+                {
+                    "id": "record",
+                    "function": {
+                        "name": "record_consultation",
+                        "arguments": json.dumps(record, ensure_ascii=False),
+                    },
+                }
+            ],
+        }, {"total_tokens": 100}
+
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
+    identity = headers(await login(client))
+    p = await project(client, identity)
+    result = await send(client, identity, p["id"], prompt)
+    assert result["status"] == "completed" and reply in result["answer"]
+    assert "生成并保存" not in result["answer"]
+    assert not any(event.get("tool") == "generate_prd" for event in result["events"])
+    assert any(event.get("code") == "CONTROL_QUOTE_INVALID" for event in result["events"])
+    detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
+    assert detail["items"] == []
+    assert detail["project"]["discovery"]["scope"] == ["售后工单流转"]
+
+
+@pytest.mark.skipif(
+    __import__("os").environ.get("SUPPORTFLOW_TEST_LIVE_MODEL") != "1",
+    reason="Explicit opt-in for a paid model replay in isolated PostgreSQL",
+)
+async def test_live_template_question_keeps_consultation_without_generating(postgres_auth):
+    from backend.config import get_settings
+
+    service = postgres_auth
+    principal = await service.authenticate(
+        (await service.login("alice", "Postgres-test-password")).access_token
+    )
+    store = ProjectStore(service.store.database)
+    p = await store.start_consultation(principal, StartConsultation(request_id=uuid4()))
+    pid = UUID(p["id"])
+    prompt = (
+        "愿意尝试。我们内部确实重度依赖企业微信，如果能用简道云这种低代码工具在企微里搭一个"
+        "轻量级的工单流转，前期投入不高的话，完全可以先跑个试点。你们有现成的企微+简道云"
+        "（或类似工具）的售后工单模板吗？我们可以先内部测试一下。"
+    )
+    row, _ = await store.start_run(principal, pid, SendMessage(request_id=uuid4(), content=prompt))
+    runtime = AgentRuntime(get_settings().agent)
+    try:
+        runtime.reserve()
+        await runtime.execute(store, principal, pid, UUID(row["id"]), prompt)
+        result = await store.run(principal, pid, UUID(row["id"]))
+        assert result["status"] == "completed", result["answer"]
+        assert not any(event.get("tool") == "generate_prd" for event in result["events"])
+        assert any(term in result["answer"] for term in ("模板", "示例", "工单"))
+        detail = await store.detail(principal, pid, summaries=True)
+        assert not detail["items"] and detail["project"]["discovery"]
+        assert "已根据保存的业务信息生成并保存" not in result["answer"]
+    finally:
+        await runtime.close()
+
+
 @pytest.mark.parametrize(
     "global_enabled,user_enabled", [(True, True), (False, True), (True, False)]
 )
@@ -461,7 +563,8 @@ async def test_interruption_after_discussion_commit_preserves_pair(auth_api, mon
     p = await project(client, identity)
     await send(client, identity, p["id"], "我负责销售，她负责发货")
     result = await send(client, identity, p["id"], "帮我生成一份草案吧")
-    assert result["status"] == "completed" and "整理中断" in result["answer"]
+    # The preliminary discussion was saved, but document generation was cancelled.
+    assert result["status"] == "failed" and "整理中断" in result["answer"]
     async with database.session() as session:
         rows = list(
             await session.scalars(
@@ -502,3 +605,299 @@ async def test_first_model_failure_preserves_raw_message_and_safe_failure_reply(
     await ProjectStore(database).fail(UUID(result["id"]), "重复处理")
     detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
     assert len(detail["messages"]) == 2
+
+
+def test_filling_a_chapter_does_not_confirm_an_automatic_technology_stack():
+    from backend.agents.consultation.state import verified_patch
+    from backend.models.consultation import Extraction
+
+    prompt = "请把技术选型章节补齐，不用再向我确认。"
+    extraction = Extraction.model_validate(
+        {
+            "reply": "已收到",
+            "notes": {
+                "technology_preference": "Java 21 + Spring Boot 3.3",
+                "scope": ["会议室预约"],
+            },
+            "sources": [
+                {
+                    "field": "technology_preference",
+                    "value": "Java 21 + Spring Boot 3.3",
+                    "quote": prompt,
+                },
+                {"field": "scope", "value": "会议室预约", "quote": "会议室预约"},
+            ],
+        }
+    )
+    patch, sources = verified_patch(
+        extraction,
+        prompt,
+        "run",
+        {},
+        [{"id": "old", "run_id": "old-run", "role": "user", "content": "我需要会议室预约"}],
+    )
+    assert "technology_preference" not in patch
+    assert patch["scope"] == ["会议室预约"]
+    assert all(s.field != "technology_preference" for s in sources)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "我是后勤，不懂Java、Python😂，先只管办公电脑报修。",
+        "Java和Python只是我举例，不是我选的技术，先只管办公电脑报修。",
+    ],
+)
+def test_neutral_technology_mentions_do_not_turn_into_constraints(prompt):
+    from backend.agents.consultation.state import verified_patch
+
+    record = ConsultationRecord(
+        facts=[
+            {"field": "technology_preference", "value": "Java + Python", "source_id": "current:0"},
+            {"field": "constraints", "value": "不能使用Java、Python", "source_id": "current:0"},
+            {"field": "constraints", "value": "要求零代码方案", "source_id": "current:0"},
+            {"field": "scope", "value": "办公电脑报修", "source_id": "current:0"},
+        ]
+    )
+    patch, sources = verified_patch(record.turn(), prompt, "run", {})
+    assert patch == {"scope": ["办公电脑报修"]}
+    assert len(sources) == 1
+
+
+def test_explicit_technical_choices_remain_valid_and_specific_quotes_are_checked():
+    from backend.agents.consultation.state import verified_patch
+
+    prompt = "不懂Java，但确定使用Python。必须PostgreSQL，不要Node.js。"
+    record = ConsultationRecord(
+        facts=[
+            {
+                "field": "technology_preference",
+                "value": "Python + PostgreSQL",
+                "source_id": "current:0",
+                "intent": "required",
+            },
+            {
+                "field": "constraints",
+                "value": "不要Node.js",
+                "source_id": "current:0",
+                "intent": "excluded",
+            },
+        ]
+    )
+    patch, _ = verified_patch(record.turn(), prompt, "run", {})
+    assert patch["technology_preference"] == "Python + PostgreSQL"
+    assert patch["constraints"] == ["不要Node.js"]
+    record.facts[0].quote = "客户选择了Python"
+    _, sources = verified_patch(record.turn(), prompt, "run", {})
+    assert sources[0].quote == prompt
+    record.facts[0].source_id = "invented"
+    with pytest.raises(ValueError):
+        verified_patch(record.turn(), prompt, "run", {})
+
+
+@pytest.mark.parametrize("prompt", ["不要使用Java", "不是Java，是Python", "不能选Java，使用Python"])
+def test_excluded_technology_cannot_be_saved_as_a_positive_choice(prompt):
+    from backend.agents.consultation.state import verified_patch
+
+    record = ConsultationRecord(
+        facts=[
+            {"field": "technology_preference", "value": "Java", "source_id": "current:0"},
+            {
+                "field": "constraints",
+                "value": prompt.split("，")[0],
+                "source_id": "current:0",
+                "intent": "excluded",
+            },
+        ]
+    )
+    patch, sources = verified_patch(record.turn(), prompt, "run", {})
+    assert patch == {"constraints": [prompt.split("，")[0]]}
+    assert len(sources) == 1
+
+
+def test_empty_optional_fact_does_not_discard_real_business_information():
+    from backend.agents.consultation.state import verified_patch
+
+    record = ConsultationRecord.model_validate(
+        {
+            "facts": [
+                {"field": "technology_preference", "value": "", "source_id": "current:0"},
+                {"field": "scope", "value": "办公电脑报修", "source_id": "current:0"},
+            ]
+        }
+    )
+    patch, _ = verified_patch(record.turn(), "只做办公电脑报修", "run", {})
+    assert patch == {"scope": ["办公电脑报修"]}
+
+
+def test_removing_unknown_technology_placeholder_does_not_poison_other_facts():
+    from backend.agents.consultation.state import verified_patch
+
+    record = ConsultationRecord(
+        facts=[{"field": "scope", "value": "办公电脑报修", "source_id": "current:0"}],
+        remove_facts=[
+            {"field": "technology_preference", "value": "待确认", "source_id": "old-message:0"}
+        ],
+    )
+    patch, sources = verified_patch(
+        record.turn(), "首期只做办公电脑报修", "run", {"technology_preference": "待确认"}
+    )
+    assert patch == {"scope": ["办公电脑报修"]} and len(sources) == 1
+
+
+def test_removal_of_a_nonexistent_technical_fact_is_a_noop_not_a_batch_failure():
+    from backend.agents.consultation.state import verified_patch
+
+    record = ConsultationRecord(
+        facts=[{"field": "scope", "value": "办公电脑报修", "source_id": "current:0"}],
+        remove_facts=[
+            {
+                "field": "technology_preference",
+                "value": "Java, Python",
+                "source_id": "old:0",
+                "quote": "模型拼接的无效引文",
+            }
+        ],
+    )
+    patch, sources = verified_patch(
+        record.turn(), "只做办公电脑报修", "run", {"technology_preference": "待确认"}
+    )
+    assert patch == {"scope": ["办公电脑报修"]} and len(sources) == 1
+
+
+def test_catalog_id_is_authoritative_and_unverified_quote_is_never_stored():
+    from backend.agents.consultation.state import verified_patch
+
+    prompt = "纠正：技术没有选择，只做办公电脑报修"
+    history = [{"id": "old", "role": "user", "content": "以前只用群聊", "run_id": "old-run"}]
+    record = ConsultationRecord(
+        facts=[
+            {
+                "field": "scope",
+                "value": "办公电脑报修",
+                "source_id": "current:0",
+                "quote": "只做办公电脑报修",
+            }
+        ]
+    )
+    patch, sources = verified_patch(record.turn(), prompt, "run", {}, history)
+    assert patch == {"scope": ["办公电脑报修"]}
+    assert sources[0].run_id == "run" and sources[0].message_id == ""
+    record.facts[0].quote = "伪造的用户原话"
+    _, sources = verified_patch(record.turn(), prompt, "run", {}, history)
+    assert sources[0].quote == prompt
+    record.facts[0].source_id = "assistant:0"
+    with pytest.raises(ValueError):
+        verified_patch(record.turn(), prompt, "run", {}, history)
+
+
+def test_question_budget_handles_long_list_and_repeated_questions_without_losing_statements():
+    from backend.agents.consultation.state import limit_questions
+
+    reply = (
+        "先处理漏单。\n1. 谁接单？\n2. 怎么分派？\n"
+        "3. 用什么语言？\n4. 什么界面？\n这些可以逐步讨论。"
+    )
+    public, questions = limit_questions(reply)
+    assert len(questions) == public.count("？") == 2
+    assert "谁接单" in public and "怎么分派" in public
+    assert "什么语言" not in public and "这些可以逐步讨论" in public
+    public, questions = limit_questions(reply, asked=["谁接单？", "怎么分派？"], limit=0)
+    assert not questions and "？" not in public and "先处理漏单" in public
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+async def test_record_protocol_repair_is_bounded_and_preserves_valid_facts(
+    auth_api, monkeypatch, repair_succeeds
+):
+    client, _, _ = auth_api
+    identity = headers(await login(client))
+    p = await project(client, identity)
+    calls = []
+
+    async def complete(self, messages, **kwargs):
+        calls.append(kwargs.get("tool_choice"))
+        facts = (
+            [{"field": "scope", "value": "办公电脑报修", "source_id": "current:0"}]
+            if repair_succeeds and len(calls) == 2
+            else [{"field": "invalid-field", "value": "错误字段", "source_id": "current:0"}]
+        )
+        return {
+            "content": "已收到您的说明。",
+            "tool_calls": [
+                {
+                    "id": "record",
+                    "type": "function",
+                    "function": {
+                        "name": "record_consultation",
+                        "arguments": json.dumps({"facts": facts}, ensure_ascii=False),
+                    },
+                }
+            ],
+        }, {"total_tokens": 100}
+
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
+    run = await send(client, identity, p["id"], "首期只做办公电脑报修，先记录不生成")
+    detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
+    assert len(calls) == 2 and all(
+        choice["function"]["name"] == "record_consultation" for choice in calls
+    )
+    if repair_succeeds:
+        assert detail["project"]["discovery"]["scope"] == ["办公电脑报修"]
+        assert not detail["project"]["consultation"]["memory_pending"]
+    else:
+        assert detail["project"]["discovery"] == {} and "原话已保留" in run["answer"]
+
+
+async def test_conversation_saves_correction_and_bounds_questions_in_persisted_reply(
+    auth_api, monkeypatch
+):
+    from backend.models.discovery import merge_discovery
+
+    client, _, database = auth_api
+    identity = headers(await login(client))
+    p = await project(client, identity)
+    async with database.session() as session:
+        row = await session.get(Project, UUID(p["id"]))
+        row.discovery = merge_discovery(
+            {},
+            {
+                "technology_preference": "Java",
+                "constraints": ["禁止使用Java和Python"],
+            },
+        )
+
+    async def complete(self, messages, **kwargs):
+        payload = ConsultationRecord(
+            facts=[{"field": "scope", "value": "办公电脑报修", "source_id": "current:0"}],
+            remove_facts=[
+                {"field": "technology_preference", "value": "Java", "source_id": "current:0"},
+                {"field": "constraints", "value": "禁止使用Java和Python", "source_id": "current:0"},
+            ],
+        ).model_dump()
+        return {
+            "content": "已记录。谁接单？怎么分派？喜欢什么界面？",
+            "tool_calls": [
+                {
+                    "id": "record",
+                    "type": "function",
+                    "function": {
+                        "name": "record_consultation",
+                        "arguments": json.dumps(payload, ensure_ascii=False),
+                    },
+                }
+            ],
+        }, {"total_tokens": 100}
+
+    monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
+    monkeypatch.setattr(AgentRuntime, "complete", complete)
+    result = await send(
+        client, identity, p["id"], "纠正：Java和Python只是举例，不是我的选择；先只管办公电脑报修。"
+    )
+    detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
+    assert result["answer"].count("？") == 2
+    assert detail["project"]["discovery"]["technology_preference"] == ""
+    assert detail["project"]["discovery"]["constraints"] == []
+    assert detail["project"]["discovery"]["scope"] == ["办公电脑报修"]
+    assert len(detail["project"]["consultation"]["asked_questions"]) == 2

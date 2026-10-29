@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ModelPurpose = Literal["consultation", "draft_planner", "draft_writer"]
+ModelPurpose = Literal["consultation", "draft_planner", "draft_writer", "draft_reviewer"]
 
 
 class ModelProfile(BaseModel):

@@ -81,6 +81,12 @@ class DraftTools:
                 raise ValueError("Tool arguments must be an object")
             if name == "plan_draft":
                 plan = DraftPlan.model_validate(args)
+                if self.state.original_blocks:
+                    originals = {b["id"]: b for b in self.state.original_blocks}
+                    if any(s.id not in originals for s in plan.sections):
+                        raise ValueError("Revision must use existing section IDs")
+                    for section in plan.sections:
+                        section.title = originals[section.id]["title"]
                 # Already written/attempted chapters cannot silently disappear from the plan.
                 known = {s.id: s for s in plan.sections}
                 if any(known.get(sid) != spec for sid, spec in self.state.section_specs.items()):
@@ -191,6 +197,22 @@ class DraftTools:
                 "message": "请使用大纲返回的section_id。",
             }
         if spec is None:
+            original = next(
+                (b for b in self.state.original_blocks if b["id"] == request.section_id), None
+            )
+            if original:
+                spec = DraftSection(
+                    id=original["id"],
+                    title=original["title"],
+                    focus=request.focus or self.state.user_request,
+                )
+            elif self.state.original_blocks:
+                return {
+                    "ok": False,
+                    "code": "SECTION_NOT_FOUND",
+                    "message": "补写请使用existing_sections中的原章节ID。",
+                }
+        if spec is None:
             if not request.title:
                 raise ValueError("A standalone section needs a title")
             spec = DraftSection(
@@ -214,7 +236,12 @@ class DraftTools:
                 {
                     **self.state.context(include_written=True),
                     "current_section": spec.model_dump(),
-                    "outline": self.state.plan.model_dump() if self.state.plan else None,
+                    "outline": [s.model_dump() for s in self.state.plan.sections]
+                    if self.state.plan
+                    else None,
+                    "original_section": next(
+                        (b["content"] for b in self.state.original_blocks if b["id"] == spec.id), ""
+                    ),
                 },
                 output_limit=self.flow.agent.settings.draft_section_output_tokens,
                 purpose="draft_writer",

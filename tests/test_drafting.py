@@ -8,9 +8,49 @@ from test_consultation import install_model, send
 from test_projects import project
 
 from backend.agents.consultation.nodes import is_draft_command
+from backend.agents.consultation.state import valid_draft_request
 from backend.agents.runtime import AgentRuntime
 from backend.db.project_store import ProjectStore
 from backend.models.projects import ProjectError
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "愿意尝试，我们可以先跑个试点",
+        "你们有现成的售后工单模板吗",
+        "生成需求书是什么意思？",
+        "如果我说帮我生成草案呢",
+        "他说帮我生成一份草案吧",
+        "先别生成草案，先讨论模板",
+        "帮我看看怎么修改草案",
+        "信息够了，先不要生成需求文档",
+    ],
+)
+def test_document_control_rejects_discussion_questions_and_negation(text):
+    assert not valid_draft_request(text, text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "帮我生成一份草案吧",
+        "信息够了，直接出方案",
+        "请根据我们沟通的信息整理需求文档",
+        "请把草案中的权限部分补齐",
+        "现在生成吧",
+        "给我一份需求书",
+    ],
+)
+def test_document_control_accepts_explicit_natural_requests(text):
+    assert valid_draft_request(text, text)
+
+
+def test_clipped_quote_cannot_bypass_negation_or_later_cancellation():
+    assert not valid_draft_request("生成草案", "先别生成草案")
+    assert not valid_draft_request("生成草案", "先生成草案，等等，先别生成草案")
+    assert not valid_draft_request("生成草案", "先生成草案，先别生成")
+    assert not valid_draft_request("生成草案", "先生成草案，不用了")
 
 
 @pytest.mark.parametrize(
@@ -61,9 +101,15 @@ async def test_writer_uses_saved_notes_and_never_reextracts_or_asks_for_document
     assert len(model.calls) == before + 1 and len(writes) == 1
     assert writes[0]["business_notes"]["scope"] == model.notes["scope"]
     detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
-    assert len(detail["items"]) == 1 and "客户已说明的信息" in detail["items"][0]["content"]
-    assert "登记和查询预约" in detail["items"][0]["content"]
-    assert "用户未明确选择的设计属于【自动生成】方案" in detail["items"][0]["content"]
+    assert len(detail["items"]) == 1 and detail["items"][0]["content_loaded"] is False
+    document = (
+        await client.get(
+            f"/api/projects/{p['id']}/items/{detail['items'][0]['id']}", headers=identity
+        )
+    ).json()
+    assert "客户已说明的信息" in document["content"]
+    assert "登记和查询预约" in document["content"]
+    assert "用户未明确选择的设计属于【自动生成】方案" in document["content"]
     assert detail["project"]["revision"] == 0 and detail["items"][0]["questions"]
 
 
@@ -83,8 +129,13 @@ async def test_writer_failure_returns_honest_saved_initial_draft_without_retry(
     assert len(model.calls) == before + 1 and "private" not in str(result)
     detail = (await client.get(f"/api/projects/{p['id']}", headers=identity)).json()
     assert len(detail["messages"]) == 4 and len(detail["items"]) == 1
-    assert "详细说明未生成" in detail["items"][0]["content"]
-    assert "登记和查询预约" in detail["items"][0]["content"]
+    document = (
+        await client.get(
+            f"/api/projects/{p['id']}/items/{detail['items'][0]['id']}", headers=identity
+        )
+    ).json()
+    assert "详细说明未生成" in document["content"]
+    assert "登记和查询预约" in document["content"]
 
 
 async def test_no_business_context_cannot_invent_a_draft(auth_api, monkeypatch):
@@ -160,4 +211,9 @@ async def test_section_draft_commits_once_and_keeps_human_review(
     assert detail["project"]["phase"] == "discovery" and detail["project"]["revision"] == 0
     assert detail["project"]["consultation"]["status"] == "draft_ready"
     assert "private" not in str(result)
-    assert ("本章暂未生成" in detail["items"][0]["content"]) == bool(failed_section)
+    document = (
+        await client.get(
+            f"/api/projects/{p['id']}/items/{detail['items'][0]['id']}", headers=identity
+        )
+    ).json()
+    assert ("本章暂未生成" in document["content"]) == bool(failed_section)

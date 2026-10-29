@@ -71,7 +71,9 @@ class ProjectTools:
         self.drafts: list[dict] = []
         self.notes: list[dict] = []
 
-    async def call(self, name, arguments):
+    async def call(self, name, arguments, *, state=None):
+        if state is not None:
+            self.drafts, self.notes = state["drafts"], state["notes"]
 
         handlers = {
             "remember_requirements": remember,
@@ -96,7 +98,7 @@ async def prepare(context, arguments):
     draft = DraftItem.model_validate(arguments)
     if draft.kind in {"task", "acceptance"} and context.principal.account.role != "admin":
         raise ProjectError("FORBIDDEN", "内部任务与交付记录由负责人创建", 403)
-    snapshot = await context.store.detail(context.principal, context.project_id)
+    snapshot = await context.store.detail(context.principal, context.project_id, summaries=True)
     if draft.kind != "specification" and not snapshot["project"]["revision"]:
         raise ProjectError("BASELINE_REQUIRED", "请先完成初版需求书确认")
     if len(context.drafts) >= 3:
@@ -112,7 +114,7 @@ async def prepare(context, arguments):
 
 
 async def read_project(context, arguments):
-    snapshot = await context.store.detail(context.principal, context.project_id)
+    snapshot = await context.store.detail(context.principal, context.project_id, summaries=True)
     return {
         "project": snapshot["project"],
         "baseline": snapshot["baseline"],
@@ -133,8 +135,15 @@ async def compare_baseline(context, arguments):
     content = arguments.get("content", "")
     if not isinstance(content, str) or len(content) > 120000:
         raise ValueError("正文超出限制")
-    snapshot = await context.store.detail(context.principal, context.project_id)
-    original = snapshot["baseline"]["content"] if snapshot["baseline"] else ""
+    snapshot = await context.store.detail(context.principal, context.project_id, summaries=True)
+    baseline = (
+        await context.store.item(
+            context.principal, context.project_id, UUID(snapshot["baseline"]["id"])
+        )
+        if snapshot["baseline"]
+        else None
+    )
+    original = baseline["content"] if baseline else ""
     difference = "\n".join(
         difflib.unified_diff(
             original.splitlines(),

@@ -4,11 +4,11 @@ from uuid import UUID
 import httpx
 import pytest_asyncio
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.api.v1.auth import cookie_name
-from backend.config import AuthSettings, Settings
+from backend.config import AuthSettings, RecoverySettings, Settings
 from backend.db.auth_store import AuthStore
 from backend.db.session import Database
 from backend.dependencies import get_database
@@ -22,10 +22,18 @@ ORIGIN = "http://test"
 @pytest_asyncio.fixture
 async def auth_api(tmp_path):
     database = Database(create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'auth.db'}"))
+
+    # SQLite ignores SELECT FOR UPDATE. Serialize fixture transactions so it cannot invent
+    # duplicate message sequences while production PostgreSQL holds the project row lock.
+    @event.listens_for(database.engine.sync_engine, "begin")
+    def begin(connection):
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+
     async with database.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     settings = Settings(
         _env_file=None,
+        recovery=RecoverySettings(enabled=False),
         auth=AuthSettings(
             signing_key=SecretStr("auth-test-key-" * 4),
             allowed_origins=(ORIGIN,),

@@ -1,9 +1,20 @@
-from langgraph.graph import START, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
-from backend.agents.consultation.nodes import ConsultationNodes
-from backend.agents.consultation.state import GraphState
+from backend.agents.consultation.nodes import ConsultationNodes, FactNodes
+from backend.agents.consultation.state import FactState, GraphState
 from backend.db.checkpoints import DatabaseCheckpointer
+
+
+async def run_fact_graph(agent, store, principal, project_id, job):
+    nodes = FactNodes(agent, store, principal, project_id, job)
+    graph = StateGraph(FactState)
+    graph.add_node("extract_facts", nodes.extract_facts)
+    graph.add_node("persist_facts", nodes.persist_facts)
+    graph.add_edge(START, "extract_facts")
+    graph.add_edge("extract_facts", "persist_facts")
+    graph.add_edge("persist_facts", END)
+    await graph.compile().ainvoke({"patch": {}, "sources": []}, config={"recursion_limit": 5})
 
 
 def build_graph(nodes, saver):

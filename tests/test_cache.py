@@ -148,7 +148,16 @@ async def test_snapshot_version_and_access_are_checked_before_cache(auth_api, ca
     assert cache.counters["hits"] == 1
     await store.event(rid, {"type": "node", "summary": "处理业务"})
     assert len((await client.get(url, headers=identity)).json()["events"]) == 1
-    await store.finish(principal, pid, rid, 0, "已整理", [], defer_completion=True)
+    await store.finish(
+        principal,
+        pid,
+        rid,
+        0,
+        "已整理",
+        [],
+        defer_completion=True,
+        consultation={"last_run_id": str(rid)},
+    )
     assert (await client.get(url, headers=identity)).json()["status"] == "running"
     await store.checkpoint_ready(rid)
     assert (await client.get(url, headers=identity)).json()["status"] == "completed"

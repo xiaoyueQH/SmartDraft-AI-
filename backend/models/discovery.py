@@ -14,7 +14,11 @@ def merge_discovery(existing: dict, update: dict) -> dict:
             else value
         )
     for key, removed in patch.get("remove_facts", {}).items():
-        result[key] = [value for value in result.get(key, []) if value not in removed]
+        old = result.get(key, [])
+        if isinstance(old, list):
+            result[key] = [value for value in old if value not in removed]
+        elif old in removed and key not in patch:
+            result[key] = ""
     resolved = patch.get("resolved_questions", [])
     result["open_questions"] = [
         value for value in result.get("open_questions", []) if value not in resolved

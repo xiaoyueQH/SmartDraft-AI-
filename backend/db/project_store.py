@@ -9,7 +9,7 @@ from sqlalchemy import and_, func, or_, select
 from backend.db.identity import lock_identity
 from backend.db.session import Database
 from backend.models.auth import Principal
-from backend.models.consultation import ConsultationState
+from backend.models.consultation import ConsultationState, FactEvidence
 from backend.models.discovery import merge_discovery
 from backend.models.orm import User
 from backend.models.projects import (
@@ -27,13 +27,45 @@ from backend.models.projects import (
     SendMessage,
     StartConsultation,
 )
+from backend.models.review import DocumentRevision, split_markdown
 
 
 def now():
     return datetime.now(UTC)
 
 
-def view(row):
+def append_message(
+    session,
+    project,
+    content,
+    sender_type,
+    *,
+    sender=None,
+    run_id=None,
+    reply_to_id=None,
+    created_at=None,
+    login_session_id=None,
+):
+    project.message_seq = (project.message_seq or 0) + 1
+    row = ProjectMessage(
+        id=uuid4(),
+        project_id=project.id,
+        run_id=run_id,
+        role="user" if sender_type == "customer" else "assistant",
+        content=content,
+        sequence=project.message_seq,
+        sender_id=sender.id if sender else None,
+        sender_type=sender_type,
+        sender_name=sender.display_name if sender else "AI顾问" if sender_type == "ai" else "系统",
+        reply_to_id=reply_to_id,
+        login_session_id=login_session_id,
+        created_at=created_at or now(),
+    )
+    session.add(row)
+    return row
+
+
+def view(row, *, exclude=()):
     return {
         column.name: (
             str(value)
@@ -43,7 +75,23 @@ def view(row):
             else value
         )
         for column in row.__table__.columns
+        if column.name not in {*exclude, "login_session_id"}
         for value in [getattr(row, column.name)]
+    }
+
+
+def summary_columns(model, *, exclude=()):
+    return [column for column in model.__table__.columns if column.name not in exclude]
+
+
+def mapping_view(row):
+    return {
+        key: str(value)
+        if isinstance(value, UUID)
+        else value.isoformat()
+        if isinstance(value, datetime)
+        else value
+        for key, value in row.items()
     }
 
 
@@ -51,6 +99,32 @@ def fingerprint(action, data):
     return hashlib.sha256(
         json.dumps([action, data], sort_keys=True, ensure_ascii=False, default=str).encode()
     ).hexdigest()
+
+
+async def remember_revision(session, row, actor_id, action, blocks=None):
+    if (
+        await session.scalar(
+            select(DocumentRevision.id).where(
+                DocumentRevision.item_id == row.id, DocumentRevision.version == row.version
+            )
+        )
+        is None
+    ):
+        session.add(
+            DocumentRevision(
+                id=uuid4(),
+                project_id=row.project_id,
+                item_id=row.id,
+                actor_id=actor_id,
+                version=row.version,
+                title=row.title,
+                content=row.content,
+                questions=row.questions,
+                action=action,
+                blocks=blocks if blocks is not None else split_markdown(row.content),
+                created_at=now(),
+            )
+        )
 
 
 class ProjectStore:
@@ -136,6 +210,10 @@ class ProjectStore:
         if operation:
             if operation.fingerprint != digest:
                 raise ProjectError("REQUEST_REUSED", "请求编号已用于其他内容，请刷新后重新操作")
+            if operation.result.get("_superseded_requirement"):
+                raise ProjectError(
+                    "REQUIREMENT_SUPERSEDED", "这份旧草案已被最新需求替代，请刷新项目"
+                )
             return operation.result
         return None
 
@@ -299,7 +377,9 @@ class ProjectStore:
                 view(project),
             )
 
-    async def detail(self, principal, project_id):
+    async def detail(self, principal, project_id, *, summaries=False):
+        if summaries:
+            return await self.summary(principal, project_id)
         async with self.database.session() as session:
             project, _ = await self._project(session, principal, project_id)
             items = list(
@@ -323,6 +403,10 @@ class ProjectStore:
                     select(ProjectRun)
                     .where(
                         ProjectRun.project_id == project_id,
+                        or_(
+                            ProjectRun.options["silent"].as_boolean().is_(None),
+                            ProjectRun.options["silent"].as_boolean().is_(False),
+                        ),
                         or_(
                             ProjectRun.id.in_([row.run_id for row in messages if row.run_id]),
                             ProjectRun.id.in_(
@@ -356,6 +440,154 @@ class ProjectStore:
                 "baseline": view(baseline) if baseline else None,
             }
 
+    async def summary(self, principal, project_id):
+        """Bounded page data; full documents and execution traces have separate reads."""
+        async with self.database.session() as session:
+            project, _ = await self._project(session, principal, project_id)
+            columns = summary_columns(
+                ProjectItem, exclude={"content", "resolution", "acceptance_note"}
+            )
+            item_query = select(*columns, func.substr(ProjectItem.content, 1, 140).label("content"))
+            items = (
+                (
+                    await session.execute(
+                        item_query.where(ProjectItem.project_id == project_id)
+                        .order_by(ProjectItem.created_at.desc(), ProjectItem.id)
+                        .limit(41)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            messages = list(
+                await session.scalars(
+                    select(ProjectMessage)
+                    .where(ProjectMessage.project_id == project_id)
+                    .order_by(ProjectMessage.created_at.desc(), ProjectMessage.id)
+                    .limit(40)
+                )
+            )
+            run_columns = summary_columns(ProjectRun, exclude={"events", "prompt", "answer"})
+            runs = (
+                (
+                    await session.execute(
+                        select(*run_columns)
+                        .where(
+                            ProjectRun.project_id == project_id,
+                            or_(
+                                ProjectRun.options["silent"].as_boolean().is_(None),
+                                ProjectRun.options["silent"].as_boolean().is_(False),
+                            ),
+                            or_(
+                                ProjectRun.id.in_([m.run_id for m in messages if m.run_id]),
+                                ProjectRun.id.in_(
+                                    select(ProjectRun.id)
+                                    .where(ProjectRun.project_id == project_id)
+                                    .order_by(ProjectRun.created_at.desc(), ProjectRun.id)
+                                    .limit(5)
+                                ),
+                            ),
+                        )
+                        .order_by(ProjectRun.created_at.desc(), ProjectRun.id)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            baseline = (
+                (
+                    await session.execute(
+                        item_query.where(
+                            ProjectItem.project_id == project_id,
+                            ProjectItem.published_revision == project.revision,
+                        ).limit(1)
+                    )
+                )
+                .mappings()
+                .first()
+                if project.revision
+                else None
+            )
+
+            def item_view(row):
+                return {
+                    **mapping_view(row),
+                    "content_loaded": False,
+                    "resolution": "",
+                    "acceptance_note": "",
+                }
+
+            return {
+                "project": view(project),
+                "items": [item_view(row) for row in items[:40]],
+                "has_more_items": len(items) > 40,
+                "messages": [view(row) for row in reversed(messages)],
+                "runs": [
+                    {
+                        **mapping_view(row),
+                        "events": [],
+                        "prompt": "",
+                        "answer": "",
+                        "details_loaded": False,
+                    }
+                    for row in runs
+                ],
+                "baseline": item_view(baseline) if baseline else None,
+            }
+
+    async def authorize(self, principal, project_id):
+        async with self.database.session() as session:
+            await self._project(session, principal, project_id)
+
+    async def fact_sources(self, principal, project_id, offset, limit):
+        async with self.database.session() as session:
+            await self._project(session, principal, project_id)
+            rows = list(
+                await session.scalars(
+                    select(FactEvidence)
+                    .where(FactEvidence.project_id == project_id)
+                    .order_by(FactEvidence.created_at.desc(), FactEvidence.id)
+                    .offset(offset)
+                    .limit(limit + 1)
+                )
+            )
+            return {"items": [view(row) for row in rows[:limit]], "has_more": len(rows) > limit}
+
+    async def fact_source(self, principal, project_id, evidence_id):
+        async with self.database.session() as session:
+            await self._project(session, principal, project_id)
+            evidence = await session.scalar(
+                select(FactEvidence).where(
+                    FactEvidence.id == evidence_id, FactEvidence.project_id == project_id
+                )
+            )
+            if not evidence:
+                raise ProjectError("SOURCE_NOT_FOUND", "来源不存在", 404)
+            source = evidence.source
+            if source.get("message_id"):
+                content = await session.scalar(
+                    select(ProjectMessage.content).where(
+                        ProjectMessage.id == UUID(source["message_id"]),
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.role == "user",
+                    )
+                )
+            else:
+                content = await session.scalar(
+                    select(ProjectRun.prompt).where(
+                        ProjectRun.id == UUID(source["run_id"]),
+                        ProjectRun.project_id == project_id,
+                    )
+                )
+            verified = content is not None and (
+                hashlib.sha256(content.encode()).hexdigest() == source["message_sha256"]
+                and content[source["quote_start"] : source["quote_end"]] == source["quote"]
+                and hashlib.sha256(source["quote"].encode()).hexdigest() == source["quote_sha256"]
+            )
+            if not verified:
+                raise ProjectError("SOURCE_CHANGED", "来源内容已变化，不能据此确认原话", 409)
+            return {"evidence": view(evidence), "content": content, "verified": True}
+
     async def item(self, principal, project_id, item_id):
         async with self.database.session() as session:
             await self._project(session, principal, project_id)
@@ -368,9 +600,40 @@ class ProjectStore:
                 raise ProjectError("ITEM_NOT_FOUND", "资料不存在", 404)
             return view(row)
 
-    async def items(self, principal, project_id, offset, limit):
+    async def items(self, principal, project_id, offset, limit, *, summaries=False):
         async with self.database.session() as session:
             await self._project(session, principal, project_id)
+            if summaries:
+                columns = summary_columns(
+                    ProjectItem, exclude={"content", "resolution", "acceptance_note"}
+                )
+                rows = (
+                    (
+                        await session.execute(
+                            select(
+                                *columns, func.substr(ProjectItem.content, 1, 140).label("content")
+                            )
+                            .where(ProjectItem.project_id == project_id)
+                            .order_by(ProjectItem.created_at.desc(), ProjectItem.id)
+                            .offset(offset)
+                            .limit(limit + 1)
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                return {
+                    "items": [
+                        {
+                            **mapping_view(row),
+                            "content_loaded": False,
+                            "resolution": "",
+                            "acceptance_note": "",
+                        }
+                        for row in rows[:limit]
+                    ],
+                    "has_more": len(rows) > limit,
+                }
             rows = list(
                 await session.scalars(
                     select(ProjectItem)
@@ -426,6 +689,20 @@ class ProjectStore:
                 raise ProjectError("FORBIDDEN", "任务和交付记录由负责人创建", 403)
             if data.kind != "specification" and project.revision == 0:
                 raise ProjectError("BASELINE_REQUIRED", "请先完成需求书的双方确认")
+            if data.kind == "specification":
+                if project.revision:
+                    raise ProjectError("BASELINE_EXISTS", "正式需求已发布，后续调整请创建需求变更")
+                current = await session.scalar(
+                    select(ProjectItem.id).where(
+                        ProjectItem.project_id == project_id,
+                        ProjectItem.kind == "specification",
+                        ProjectItem.published_revision.is_(None),
+                    )
+                )
+                if current:
+                    raise ProjectError(
+                        "REQUIREMENT_EXISTS", "项目已有最新需求草案，请打开修改或重新生成"
+                    )
             row = ProjectItem(
                 id=uuid4(),
                 project_id=project_id,
@@ -476,7 +753,11 @@ class ProjectStore:
                 if not data.note:
                     raise ProjectError("NOTE_REQUIRED", "请填写补充说明", 422)
             elif data.action == "edit":
-                if row.status not in {"draft", "submitted"}:
+                if row.status not in {"draft", "submitted"} and not (
+                    row.kind == "specification"
+                    and row.published_revision is None
+                    and row.status in {"rejected", "withdrawn"}
+                ):
                     raise ProjectError(
                         "IMMUTABLE_ITEM", "已确认或处理中的记录不可覆盖，请创建新变更"
                     )
@@ -484,8 +765,11 @@ class ProjectStore:
                     raise ProjectError("FORBIDDEN", "不能编辑他人提交的记录", 403)
                 if not data.title or not data.content:
                     raise ProjectError("CONTENT_REQUIRED", "请填写标题和正文", 422)
+                if document:
+                    await remember_revision(session, row, actor.id, "before_edit")
                 row.title, row.content, row.questions = data.title, data.content, data.questions
                 row.status, row.customer_confirmed, row.staff_confirmed = "draft", False, False
+                row.resolution = row.acceptance_note = ""
                 row.base_revision = project.revision
             elif data.action == "submit":
                 if row.status != "draft":
@@ -546,6 +830,8 @@ class ProjectStore:
                 row.status = "closed" if data.action == "accept" else "in_progress"
                 row.acceptance_note = data.note
             row.version += 1
+            row.workflow_activity_at = now()
+            row.workflow_reminded_at = None
             project.version += 1
             await session.flush()
             return self._record(
@@ -562,6 +848,8 @@ class ProjectStore:
     def run_view(run):
         return {
             "id": str(run.id),
+            "actor_id": str(run.actor_id),
+            "cache_version": run.cache_version,
             "status": run.status,
             "events": run.events,
             "answer": run.answer,
@@ -607,7 +895,7 @@ class ProjectStore:
 
     async def _run(self, principal, project_id, run_id):
         async with self.database.session() as session:
-            await self._project(session, principal, project_id)
+            project, _ = await self._project(session, principal, project_id, write=True)
             row = await session.scalar(
                 select(ProjectRun)
                 .where(ProjectRun.id == run_id, ProjectRun.project_id == project_id)
@@ -622,16 +910,18 @@ class ProjectStore:
                 else row.created_at
             )
             if row.status == "running" and now() - started > timedelta(seconds=180):
-                row.cache_version += 1
-                if row.answer:
-                    await self._interrupt_discussion(session, row)
-                    row.status = "completed"
-                else:
-                    row.status, row.answer = "failed", "执行中断，请重新发送；正式需求未被修改。"
-                    await self._save_failed_discussion(session, row)
+                await self._recover_run(session, project, row)
             return self.run_view(row)
 
-    async def start_run(self, principal, project_id, data: SendMessage):
+    async def start_run(
+        self,
+        principal,
+        project_id,
+        data: SendMessage,
+        *,
+        conversation_version=None,
+        source_message_id=None,
+    ):
         async with self.database.session() as session:
             project, _ = await self._project(session, principal, project_id, write=True)
             previous = await session.scalar(
@@ -652,6 +942,14 @@ class ProjectStore:
                 ):
                     raise ProjectError("REQUEST_REUSED", "请求编号已用于其他内容")
                 return self.run_view(previous), False
+            if conversation_version is not None:
+                manual = data.intent == "draft" and principal.account.id == project.owner_id
+                if (
+                    project.conversation_version != conversation_version
+                    or (project.conversation_mode != "ai" and not manual)
+                    or project.conversation_mode == "pending"
+                ):
+                    raise ProjectError("CHAT_MODE_CHANGED", "接待状态已变化，请使用原请求重试", 409)
             active = await session.scalar(
                 select(ProjectRun).where(
                     ProjectRun.project_id == project_id, ProjectRun.status == "running"
@@ -667,13 +965,7 @@ class ProjectStore:
                     raise ProjectError(
                         "PROJECT_BUSY", "项目已有 Agent 正在处理，请等待当前结果", 409
                     )
-                if active.answer:
-                    await self._interrupt_discussion(session, active)
-                    active.status = "completed"
-                else:
-                    active.status, active.answer = "failed", "上次执行中断，请重新发送。"
-                    await self._save_failed_discussion(session, active)
-                active.cache_version += 1
+                await self._recover_run(session, project, active)
                 await session.flush()
             run = ProjectRun(
                 id=uuid4(),
@@ -687,7 +979,44 @@ class ProjectStore:
                 answer="",
                 created_at=now(),
             )
+            if project.conversation_mode == "ai":
+                project.support_notice = ""
             session.add(run)
+            await session.flush()
+            if source_message_id:
+                original = await session.scalar(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.id == source_message_id,
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.sender_type == "customer",
+                        ProjectMessage.sender_id == principal.account.id,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    not original
+                    or original.content != data.content
+                    or original.run_id
+                    or (original.sequence or 0) <= project.answered_through
+                    or project.auto_reply_message_id != original.id
+                    or project.auto_reply_request_id != data.request_id
+                ):
+                    raise ProjectError("REPLY_EXPIRED", "这条消息已处理或接待状态已变化", 409)
+                original.run_id = run.id
+                project.auto_reply_message_id = project.auto_reply_request_id = None
+            else:
+                project.auto_reply_message_id = project.auto_reply_request_id = None
+                append_message(
+                    session,
+                    project,
+                    run.prompt,
+                    "customer" if principal.account.id == project.owner_id else "support",
+                    sender=principal.account,
+                    run_id=run.id,
+                    created_at=run.created_at,
+                    login_session_id=principal.session_id,
+                )
             await session.flush()
             return self.run_view(run), True
 
@@ -699,6 +1028,23 @@ class ProjectStore:
             if run and run.status == "running":
                 run.events = [*run.events, {**event, "sequence": len(run.events) + 1}][:120]
                 run.cache_version += 1
+
+    async def draft_target(self, principal, project_id, expected_version):
+        async with self.database.session() as session:
+            project, _ = await self._project(session, principal, project_id)
+            if project.version != expected_version:
+                raise ProjectError("VERSION_CONFLICT", "草案资料已变化，请刷新后继续")
+            item = await session.scalar(
+                select(ProjectItem)
+                .where(
+                    ProjectItem.project_id == project_id,
+                    ProjectItem.kind == "specification",
+                    ProjectItem.published_revision.is_(None),
+                )
+                .order_by(ProjectItem.created_at.desc(), ProjectItem.id.desc())
+                .limit(1)
+            )
+            return view(item) if item else None
 
     async def finish(
         self,
@@ -715,6 +1061,7 @@ class ProjectStore:
         defer_completion=False,
         discussion_only=False,
         continue_discussion=False,
+        replacement=None,
     ):
         async with self._write_session() as session:
             project, actor = await self._project(session, principal, project_id, write=True)
@@ -761,6 +1108,20 @@ class ProjectStore:
                 project.consultation = ConsultationState.model_validate(consultation).model_dump(
                     mode="json"
                 )
+                for source in project.consultation["sources"]:
+                    if not source.get("message_sha256"):
+                        continue  # Legacy links remain readable, never fabricate historical hashes.
+                    key = fingerprint(f"fact_source:{project_id}", source)
+                    if await session.get(FactEvidence, key) is None:
+                        session.add(
+                            FactEvidence(
+                                id=key,
+                                project_id=project_id,
+                                recorded_run_id=run_id,
+                                source=source,
+                                created_at=now(),
+                            )
+                        )
             if notes:
                 for patch in notes:
                     project.discovery = merge_discovery(project.discovery, patch)
@@ -772,8 +1133,76 @@ class ProjectStore:
                     project.brief = project.discovery.get("business_background") or project.brief
                     if any("technology_preference" in patch for patch in notes):
                         project.stack = project.discovery["technology_preference"]
+            if sum(d.get("kind") == "specification" for d in drafts) > 1:
+                raise ProjectError("INVALID_REVISION", "每次只能保存一份最新需求草案")
             for draft in drafts:
                 data = DraftItem.model_validate(draft)
+                if data.kind == "specification" and project.revision:
+                    raise ProjectError("BASELINE_EXISTS", "正式需求已发布，后续调整请创建需求变更")
+                current = None
+                if data.kind == "specification" and not replacement:
+                    current = await session.scalar(
+                        select(ProjectItem)
+                        .where(
+                            ProjectItem.project_id == project_id,
+                            ProjectItem.kind == "specification",
+                            ProjectItem.published_revision.is_(None),
+                        )
+                        .with_for_update()
+                    )
+                if current is not None:
+                    current.title, current.content, current.questions = (
+                        data.title,
+                        data.content,
+                        data.questions,
+                    )
+                    current.version += 1
+                    current.status = "draft"
+                    current.customer_confirmed = current.staff_confirmed = False
+                    current.resolution = current.acceptance_note = ""
+                    self._record(
+                        session,
+                        principal,
+                        project_id,
+                        run.request_id,
+                        fingerprint("agent_regenerate", {"run": str(run_id)}),
+                        f"agent_regenerate:{current.id}",
+                        {"note": "已更新最新需求草案。"},
+                    )
+                    continue
+                if replacement:
+                    if len(drafts) != 1 or data.kind != "specification":
+                        raise ProjectError("INVALID_REVISION", "补写目标不匹配")
+                    original = await session.scalar(
+                        select(ProjectItem)
+                        .where(
+                            ProjectItem.id == UUID(str(replacement["id"])),
+                            ProjectItem.project_id == project_id,
+                        )
+                        .with_for_update()
+                    )
+                    if (
+                        original is None
+                        or original.kind != "specification"
+                        or original.published_revision is not None
+                        or original.version != replacement["version"]
+                    ):
+                        raise ProjectError("VERSION_CONFLICT", "原草稿已变化，补写结果未覆盖正文")
+                    original.content, original.questions = data.content, data.questions
+                    original.version += 1
+                    original.status = "draft"
+                    original.customer_confirmed = original.staff_confirmed = False
+                    original.resolution = original.acceptance_note = ""
+                    self._record(
+                        session,
+                        principal,
+                        project_id,
+                        run.request_id,
+                        fingerprint("agent_revision", {"run": str(run_id)}),
+                        f"agent_revision:{original.id}",
+                        {"note": "已补写最新需求草案的指定章节。"},
+                    )
+                    continue
                 if data.kind in {"task", "acceptance"} and actor.role != "admin":
                     raise ProjectError(
                         "FORBIDDEN", "客户不能通过 Agent 创建内部任务或交付记录", 403
@@ -796,30 +1225,58 @@ class ProjectStore:
                         ProjectMessage.project_id == project_id,
                         ProjectMessage.run_id == run_id,
                         ProjectMessage.role == "assistant",
+                        ProjectMessage.sender_type.in_(["ai", "legacy"]),
                     )
                 )
                 if assistant is None:
                     raise ProjectError("RUN_EXPIRED", "本轮沟通记录不存在，请刷新后继续")
                 assistant.content = answer
             else:
-                session.add_all(
-                    [
-                        ProjectMessage(
-                            project_id=project_id,
-                            run_id=run_id,
-                            role="user",
-                            content=run.prompt,
-                            created_at=now(),
-                        ),
-                        ProjectMessage(
-                            project_id=project_id,
-                            run_id=run_id,
-                            role="assistant",
-                            content=answer,
-                            created_at=now() + timedelta(microseconds=1),
-                        ),
-                    ]
+                user_message = await session.scalar(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.run_id == run_id,
+                        ProjectMessage.sender_type.in_(["customer", "support"]),
+                    )
                 )
+                if user_message is None:
+                    user_message = append_message(
+                        session,
+                        project,
+                        run.prompt,
+                        "customer" if actor.id == project.owner_id else "support",
+                        sender=actor,
+                        run_id=run_id,
+                        created_at=run.created_at,
+                    )
+                append_message(session, project, answer, "ai", run_id=run_id)
+                project.answered_through = max(project.answered_through, user_message.sequence or 0)
+                earlier_pending = await session.scalar(
+                    select(ProjectMessage.id)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.sender_type == "customer",
+                        ProjectMessage.sequence > project.facts_cursor,
+                        ProjectMessage.sequence < (user_message.sequence or 0),
+                    )
+                    .limit(1)
+                )
+                if (
+                    actor.id == project.owner_id
+                    and not (consultation or {}).get("memory_pending")
+                    and not earlier_pending
+                ):
+                    project.facts_cursor = max(project.facts_cursor, user_message.sequence or 0)
+            if await session.scalar(
+                select(ProjectMessage.id)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.sender_type == "customer",
+                    ProjectMessage.sequence > project.facts_cursor,
+                )
+                .limit(1)
+            ):
+                project.consultation = {**(project.consultation or {}), "memory_pending": True}
             run.status, run.answer = "running" if defer_completion else "completed", answer
             run.cache_version += 1
             project.version += 1
@@ -829,37 +1286,86 @@ class ProjectStore:
                     "sequence": len(run.events) + 1,
                     "type": "saved",
                     "summary": ("对话与沟通纪要已保存" if notes else "对话已保存")
-                    + (f"，新增 {len(drafts)} 份待确认草稿" if drafts else ""),
+                    + (
+                        "，已补写原草稿"
+                        if replacement
+                        else "，已保存最新需求草案"
+                        if drafts and all(d["kind"] == "specification" for d in drafts)
+                        else f"，新增 {len(drafts)} 份待确认草稿"
+                        if drafts
+                        else ""
+                    ),
                 },
             ]
             return project.version
 
+    async def _recover_run(self, session, project, run):
+        assistant = await session.scalar(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.run_id == run.id,
+                ProjectMessage.sender_type.in_(["ai", "legacy"]),
+                ProjectMessage.role == "assistant",
+            )
+            .limit(1)
+        )
+        committed = (
+            (project.consultation or {}).get("last_run_id") == str(run.id)
+            and assistant is not None
+            and not run.options.get("silent")
+        )
+        run.status = "completed" if committed else "failed"
+        if committed:
+            run.answer = run.answer or assistant.content
+        elif run.options.get("silent"):
+            project.extraction_error = "信息整理已中断，原话已保存，请重新整理。"
+            project.extraction_started_at = now()
+            project.consultation = {**(project.consultation or {}), "memory_pending": True}
+            run.answer = project.extraction_error
+        else:
+            await self._interrupt_discussion(session, run)
+            run.answer = (
+                run.answer + "\n\n" if run.answer else ""
+            ) + "本轮处理未完成，已保存内容保留；可继续未完成部分或联系人工。"
+            if assistant:
+                assistant.content = run.answer
+            await self._save_failed_discussion(session, run)
+        run.cache_version += 1
+
     async def _save_failed_discussion(self, session, run):
         project = await session.get(Project, run.project_id)
-        if not project or project.phase != "discovery" or project.deleted_at is not None:
+        if not project or project.deleted_at is not None or run.options.get("silent"):
             return
         if await session.scalar(
-            select(ProjectMessage.id).where(ProjectMessage.run_id == run.id).limit(1)
+            select(ProjectMessage.id)
+            .where(
+                ProjectMessage.run_id == run.id,
+                ProjectMessage.role == "assistant",
+                ProjectMessage.sender_type.in_(["ai", "legacy"]),
+            )
+            .limit(1)
         ):
             return
-        session.add_all(
-            [
-                ProjectMessage(
-                    project_id=run.project_id,
-                    run_id=run.id,
-                    role="user",
-                    content=run.prompt,
-                    created_at=run.created_at,
-                ),
-                ProjectMessage(
-                    project_id=run.project_id,
-                    run_id=run.id,
-                    role="assistant",
-                    content=run.answer,
-                    created_at=run.created_at + timedelta(microseconds=1),
-                ),
-            ]
-        )
+        if not await session.scalar(
+            select(ProjectMessage.id)
+            .where(
+                ProjectMessage.run_id == run.id,
+                ProjectMessage.sender_type.in_(["customer", "support"]),
+            )
+            .limit(1)
+        ):
+            actor = await session.get(User, run.actor_id)
+            append_message(
+                session,
+                project,
+                run.prompt,
+                "customer" if run.actor_id == project.owner_id else "support",
+                sender=actor,
+                run_id=run.id,
+                created_at=run.created_at,
+            )
+        append_message(session, project, run.answer, "ai", run_id=run.id)
 
     async def _interrupt_discussion(self, session, run):
         state = await session.scalar(
@@ -874,6 +1380,7 @@ class ProjectStore:
                 ProjectMessage.project_id == run.project_id,
                 ProjectMessage.run_id == run.id,
                 ProjectMessage.role == "assistant",
+                ProjectMessage.sender_type.in_(["ai", "legacy"]),
             )
         )
         if assistant:
@@ -888,34 +1395,32 @@ class ProjectStore:
 
     async def fail(self, run_id, message):
         async with self.database.session() as session:
+            pid = await session.scalar(select(ProjectRun.project_id).where(ProjectRun.id == run_id))
+            project = None
+            if pid is not None:
+                project = await session.scalar(
+                    select(Project).where(Project.id == pid).with_for_update()
+                )
             row = await session.scalar(
                 select(ProjectRun).where(ProjectRun.id == run_id).with_for_update()
             )
-            if row and row.status == "running":
-                row.cache_version += 1
-                if row.answer:
-                    await self._interrupt_discussion(session, row)
-                    row.status = "completed"
-                    row.events = [
-                        *row.events,
-                        {
-                            "sequence": len(row.events) + 1,
-                            "type": "node",
-                            "summary": "业务结果已保存，断点恢复将在下轮重新核对",
-                        },
-                    ]
-                    return
-                row.status, row.answer = "failed", message
-                await self._save_failed_discussion(session, row)
+            if row and project and row.status == "running":
+                row.answer = row.answer or message
+                await self._recover_run(session, project, row)
 
     async def checkpoint_ready(self, run_id):
         async with self.database.session() as session:
+            pid = await session.scalar(select(ProjectRun.project_id).where(ProjectRun.id == run_id))
+            project = (
+                await session.scalar(select(Project).where(Project.id == pid).with_for_update())
+                if pid
+                else None
+            )
             row = await session.scalar(
                 select(ProjectRun).where(ProjectRun.id == run_id).with_for_update()
             )
-            if row and row.status == "running" and row.answer:
-                row.status = "completed"
-                row.cache_version += 1
+            if row and project and row.status == "running":
+                await self._recover_run(session, project, row)
 
     async def activity(self, principal, project_id, item_id=None):
         async with self.database.session() as session:

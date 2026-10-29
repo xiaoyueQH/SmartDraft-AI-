@@ -37,6 +37,9 @@ const allSelected = computed(
     selectable.value.every((row) => selected.value.includes(row.id)),
 );
 const locked = computed(() => saving.value || !!pending.value);
+const visibleTitle = computed(() =>
+  /[\p{L}\p{N}\p{P}\p{S}]/u.test(title.value),
+);
 watch(locked, (value) => emit("busy", value), { flush: "sync" });
 function describe(error: unknown) {
   return error instanceof Error ? error.message : "操作未完成，请稍后重试";
@@ -119,6 +122,7 @@ async function submit() {
   if (
     locked.value ||
     !targets.value.length ||
+    (mode.value === "rename" && !visibleTitle.value) ||
     (mode.value === "confirm" && !acknowledged.value)
   )
     return;
@@ -369,6 +373,9 @@ onUnmounted(() => {
           :disabled="locked"
         />我已核对选中记录，确认{{ deleted ? "恢复" : "移入回收站" }}</label
       >
+      <p v-if="mode === 'rename' && !visibleTitle" role="status">
+        记录名称需要包含可见文字或符号。
+      </p>
       <div class="project-actions">
         <button
           type="button"
@@ -380,7 +387,7 @@ onUnmounted(() => {
         ><button
           class="button button-dark"
           :disabled="
-            locked || (mode === 'rename' ? !title.trim() : !acknowledged)
+            locked || (mode === 'rename' ? !visibleTitle : !acknowledged)
           "
         >
           {{

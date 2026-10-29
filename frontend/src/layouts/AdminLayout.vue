@@ -1,7 +1,49 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted, ref } from "vue";
 import { RouterLink, RouterView, useRouter } from "vue-router";
 import { auth, authState } from "../auth/session";
+import {
+  supportReasonLabels,
+  type SupportInbox,
+  type SupportRequest,
+} from "../api/projects";
 const router = useRouter();
+const supportRequests = ref<SupportRequest[]>([]);
+const supportTotal = ref(0),
+  supportError = ref(false);
+const requestMenu = ref<HTMLDetailsElement | null>(null);
+function requestReasons(item: SupportRequest) {
+  return (
+    item.reasons?.map((reason) => supportReasonLabels[reason]).join(" · ") ||
+    "等待客服接入"
+  );
+}
+let supportTimer: ReturnType<typeof setTimeout> | null = null,
+  disposed = false;
+async function loadSupportRequests() {
+  const account = authState.user?.id;
+  try {
+    const result = await auth.request<SupportInbox>(
+      "/api/conversations/requests",
+    );
+    if (!disposed && account === authState.user?.id) {
+      supportRequests.value = Array.isArray(result.items) ? result.items : [];
+      supportTotal.value = result.counts?.total ?? supportRequests.value.length;
+      supportError.value = false;
+    }
+  } catch {
+    if (!disposed && account === authState.user?.id) supportError.value = true;
+  } finally {
+    if (!disposed) supportTimer = setTimeout(loadSupportRequests, 5000);
+  }
+}
+onMounted(() => {
+  void loadSupportRequests();
+});
+onUnmounted(() => {
+  disposed = true;
+  if (supportTimer) clearTimeout(supportTimer);
+});
 const businessLinks = [
   { path: "/admin", title: "管理工作台" },
   { path: "/admin/projects", title: "客户与项目" },
@@ -79,6 +121,31 @@ async function logout() {
       <header class="admin-header">
         <span>项目协作管理系统</span>
         <div class="account-actions">
+          <details ref="requestMenu" class="support-notifications">
+            <summary>
+              接待与异常
+              <span v-if="supportTotal">{{ supportTotal }}</span>
+            </summary>
+            <div class="support-request-list">
+              <p v-if="supportError" role="status">
+                接待列表暂未更新，请在工作台重新查询。
+              </p>
+              <p v-else-if="!supportRequests.length">暂无待处理接待。</p>
+              <RouterLink
+                v-for="item in supportRequests"
+                :key="item.id"
+                :to="`/admin/projects/${item.id}`"
+                @click="requestMenu && (requestMenu.open = false)"
+                >{{ item.customer_name }} · {{ item.title
+                }}<small>{{ requestReasons(item) }}</small></RouterLink
+              >
+              <RouterLink
+                to="/admin"
+                @click="requestMenu && (requestMenu.open = false)"
+                >查看全部待处理接待 →</RouterLink
+              >
+            </div>
+          </details>
           <RouterLink to="/account">{{
             authState.user?.display_name
           }}</RouterLink
@@ -90,3 +157,37 @@ async function logout() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.support-notifications {
+  position: relative;
+}
+.support-notifications summary {
+  cursor: pointer;
+  color: #245c9c;
+}
+.support-request-list {
+  position: absolute;
+  right: 0;
+  top: 28px;
+  z-index: 30;
+  width: 320px;
+  max-height: 400px;
+  overflow: auto;
+  padding: 12px;
+  background: white;
+  border: 1px solid #dbe3ee;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px #182b4520;
+}
+.support-request-list a {
+  display: block;
+  padding: 10px 6px;
+  border-bottom: 1px solid #edf1f6;
+}
+.support-request-list small {
+  display: block;
+  margin-top: 4px;
+  color: #64748b;
+}
+</style>

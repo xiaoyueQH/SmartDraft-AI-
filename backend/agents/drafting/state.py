@@ -2,6 +2,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.agents.common import supported_technical_fact, technology_has_source
 from backend.models.consultation import Reference
 from backend.models.drafting import DraftAssumption, DraftPlan, DraftSection
 
@@ -39,6 +40,9 @@ class DraftState(BaseModel):
     direct_body: str = ""
     stop_code: str = ""
     finalization_attempted: bool = False
+    original_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    replacement: dict[str, Any] = Field(default_factory=dict)
+    original_questions: list[str] = Field(default_factory=list)
 
     def observations(self):
         """The current State is authoritative; keep the latest complete native tool exchange."""
@@ -48,9 +52,23 @@ class DraftState(BaseModel):
         return []
 
     def context(self, *, include_written=False):
+        facts = dict(self.business_notes)
+        selection = facts.get("technology_preference")
+        unverified = {}
+        if selection and not technology_has_source(selection, self.customer_statements):
+            unverified["technology_preference"] = facts.pop("technology_preference")
+        constraints = facts.get("constraints", [])
+        facts["constraints"] = [
+            value
+            for value in constraints
+            if supported_technical_fact(value, self.customer_statements, allow_excluded=True)
+        ]
+        if len(facts["constraints"]) != len(constraints):
+            unverified["constraints"] = [v for v in constraints if v not in facts["constraints"]]
         data = {
             "user_request": self.user_request,
-            "business_notes": self.business_notes,
+            "business_notes": facts,
+            "unverified_historical_notes": unverified,
             "customer_statements": self.customer_statements,
             "role_terms": (self.plan.role_terms if self.plan else [])
             or self.business_notes.get("users", []),
@@ -58,12 +76,21 @@ class DraftState(BaseModel):
             "draft_assumptions": [item.model_dump() for item in self.assumptions],
             "previous_assumptions": [item.model_dump() for item in self.previous_assumptions],
             "priority": "本次客户要求与最新已保存事实优先；历史补充方案仅供沿用，不得覆盖客户要求",
+            "existing_sections": [
+                {
+                    "id": b["id"],
+                    "title": b["title"],
+                    "needs_completion": "本章暂未生成" in b["content"],
+                }
+                for b in self.original_blocks
+            ],
+            "revision_mode": bool(self.original_blocks),
         }
         if include_written:
             data["written_sections"] = {
                 sid: {
                     "title": self.section_specs[sid].title,
-                    "excerpt": body if len(body) <= 1200 else body[:400] + "\n…\n" + body[-800:],
+                    "excerpt": body if len(body) <= 400 else body[:160] + "\n…\n" + body[-240:],
                 }
                 for sid, body in self.sections.items()
             }

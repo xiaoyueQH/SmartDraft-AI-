@@ -3,7 +3,7 @@ import asyncio
 import httpx
 from langchain_core.messages import convert_to_openai_messages
 from langchain_openai import ChatOpenAI
-from openai import APIError, APIStatusError
+from openai import APIError, APIStatusError, APITimeoutError
 
 from backend.core.llm.models import ModelError, ModelProfile
 
@@ -35,14 +35,17 @@ async def complete(
     max_output_tokens=4000,
     timeout_seconds=30,
     on_text=None,
+    tool_choice=None,
 ):
     if tools and not profile.supports_tools:
         raise ModelError("MODEL_CAPABILITY", "当前模型不支持工具调用，请联系负责人调整配置")
     if json_output and not profile.supports_json:
         raise ModelError("MODEL_CAPABILITY", "当前模型不支持结构化输出，请联系负责人调整配置")
-    kwargs = {"max_tokens": max_output_tokens}
+    kwargs = {"max_tokens": max_output_tokens, "timeout": timeout_seconds}
     if tools:
         kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
     if json_output:
         kwargs["response_format"] = {"type": "json_object"}
     try:
@@ -77,6 +80,8 @@ async def complete(
             "model": profile.model,
             "purpose": purpose,
         }
+    except APITimeoutError as error:
+        raise ModelError("MODEL_TIMEOUT", "模型处理超时，已保存内容保留") from error
     except APIStatusError as error:
         if error.status_code == 429:
             raise ModelError("MODEL_BUSY", "模型服务限流，请稍后重试；已保存内容保留") from error
