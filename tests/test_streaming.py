@@ -26,6 +26,40 @@ async def test_question_filter_also_bounds_streaming_preview(auth_api):
     assert "什么界面" not in preview["text"] and "什么语言" not in preview["text"]
 
 
+async def test_streaming_repeated_question_does_not_leave_parenthesis_fragments(auth_api):
+    from backend.agents.consultation.state import limit_questions
+    from backend.db.project_store import ProjectStore
+
+    client, _, database = auth_api
+    runtime = client._transport.app.state.agent_runtime
+    store, rid = ProjectStore(database), uuid4()
+    write = await runtime.stream_writer(
+        store, rid, transform=lambda text: limit_questions(text, asked=["预约由谁发起？"])[0]
+    )
+    for delta in ("已记录。预约由谁发起？", "（顾客、", "店员？", "）\n", "可以继续讨论。"):
+        await write(delta)
+        preview = await runtime.preview(store, rid)
+        assert "预约由谁" not in preview["text"] and "顾客" not in preview["text"]
+        assert "）" not in preview["text"]
+    assert "可以继续讨论。" in preview["text"]
+
+
+async def test_unclosed_quoted_stream_does_not_bypass_question_budget(auth_api):
+    from backend.agents.consultation.state import limit_questions
+    from backend.db.project_store import ProjectStore
+
+    client, _, database = auth_api
+    runtime = client._transport.app.state.agent_runtime
+    store, rid = ProjectStore(database), uuid4()
+    write = await runtime.stream_writer(
+        store, rid, transform=lambda text: limit_questions(text, limit=0)[0]
+    )
+    for delta in ("已记录。“", "谁接单？"):
+        await write(delta)
+        preview = await runtime.preview(store, rid)
+        assert "谁接单" not in preview["text"]
+
+
 def frames(response):
     return [
         (frame.splitlines()[0], json.loads(frame.split("data: ", 1)[1]))

@@ -913,6 +913,10 @@ function operationLabel(action: string) {
     (
       {
         create_item: "创建记录",
+        start_consultation: "开始需求沟通",
+        agent_regenerate: "重新生成需求",
+        review_apply: "应用检查修改",
+        review_discard: "保留原稿",
         submit: "提交评审 / 受理",
         confirm: "确认本版内容",
         edit: "编辑草稿",
@@ -1347,7 +1351,14 @@ onUnmounted(() => {
       <div class="project-summary">
         <div>
           <span class="project-kicker"
-            >{{ discovery ? "需求访谈" : detail.project.stack }} ·
+            >{{
+              discovery
+                ? "需求访谈"
+                : !detail.project.stack || detail.project.stack === "待确认"
+                  ? "正式项目"
+                  : detail.project.stack
+            }}
+            ·
             {{
               detail.project.revision
                 ? `已确认基线 V${detail.project.revision}`
@@ -1686,7 +1697,7 @@ onUnmounted(() => {
       <div v-else-if="tab === 'activity'" class="project-activity">
         <p class="project-muted">最近 60 条操作，记录操作者与处理说明。</p>
         <article v-for="event in activity" :key="event.id">
-          <strong>{{ event.action }}</strong>
+          <strong>{{ operationLabel(event.action) }}</strong>
           <p>{{ event.note || "已保存业务操作" }}</p>
           <small
             >{{ new Date(event.created_at).toLocaleString() }} ·

@@ -55,7 +55,7 @@ class DraftTools:
         tools = [
             tool(
                 "plan_draft",
-                "组织或调整本次大纲和统一角色称呼，不修改客户事实。",
+                "组织大纲、统一角色和跨章节设计约定；不修改客户事实。",
                 DraftPlan.model_json_schema(),
             ),
             tool(
@@ -91,6 +91,14 @@ class DraftTools:
                 known = {s.id: s for s in plan.sections}
                 if any(known.get(sid) != spec for sid, spec in self.state.section_specs.items()):
                     raise ValueError("Cannot replace attempted sections")
+                if self.state.section_specs:
+                    previous_rules = self.state.plan.design_rules if self.state.plan else []
+                    previous_roles = (
+                        self.state.plan.role_terms if self.state.plan else []
+                    ) or self.state.business_notes.get("users", [])
+                    next_roles = plan.role_terms or self.state.business_notes.get("users", [])
+                    if plan.design_rules != previous_rules or next_roles != previous_roles:
+                        raise ValueError("Cannot change shared design after writing starts")
                 self.state.plan = plan
                 self.state.assumptions = plan.assumptions
                 self.resolve(plan.resolved_questions)
@@ -248,6 +256,7 @@ class DraftTools:
                 preview_title=spec.title,
             )
             body = markdown(response)
+            body = re.sub(r"\A#{1,2}\s+" + re.escape(spec.title) + r"\s*\n+", "", body, count=1)
             self.state.sections[spec.id] = body
             return {"ok": True, "section_id": spec.id, "excerpt": body[:350]}
         except (ProjectError, httpx.HTTPError, TimeoutError, ValueError) as error:

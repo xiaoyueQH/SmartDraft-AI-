@@ -806,6 +806,56 @@ def test_question_budget_handles_long_list_and_repeated_questions_without_losing
     assert not questions and "？" not in public and "先处理漏单" in public
 
 
+@pytest.mark.parametrize(
+    "options", ["（顾客、店员、客服？）", "(顾客、店员、客服?)", "\n（如美容、维修等）"]
+)
+def test_repeated_question_removes_its_whole_parenthesized_explanation(options):
+    from backend.agents.consultation.state import limit_questions
+
+    public, questions = limit_questions(
+        "已保存权限要求。\n预约主要由谁发起？" + options + "\n后续可继续讨论。",
+        asked=["预约主要由谁发起？"],
+    )
+    assert not questions and "发起" not in public and "顾客" not in public
+    assert "美容" not in public and "）" not in public and ")" not in public
+    assert "已保存权限要求。" in public and "后续可继续讨论。" in public
+
+
+def test_question_filter_keeps_balanced_nested_options_and_opaque_code():
+    from backend.agents.consultation.state import limit_questions
+
+    raw = (
+        "谁接单？（店员（含兼职），还是老板？）\n怎么排班？\n"
+        "链接 https://example.test/?a=1\n`GET /booking?mine=1`\n"
+        "```text\n如何?这是示例\n```\n说明已保留。"
+    )
+    public, questions = limit_questions(raw)
+    assert "谁接单？（店员（含兼职），还是老板？）" in public
+    assert "怎么排班" not in public and len(questions) == 1
+    assert "https://example.test/?a=1" in public and "GET /booking?mine=1" in public
+    assert "```text\n如何?这是示例\n```" in public and "说明已保留。" in public
+
+
+def test_embedded_quoted_question_is_a_statement_not_a_followup():
+    from backend.agents.consultation.state import limit_questions
+
+    text = "已记录客户选择“需要审核？”；系统将按此执行。"
+    assert limit_questions(text, limit=0) == (text, [])
+    assert limit_questions("“谁接单？", asked=["谁接单？"], limit=0) == ("", [])
+    assert (
+        limit_questions("引用「如何处理？」仅用于说明。", limit=0)[0]
+        == "引用「如何处理？」仅用于说明。"
+    )
+    public, questions = limit_questions(
+        "已记录。\n**谁接单？**\n可以继续讨论。", asked=["谁接单？"]
+    )
+    assert not questions and "**" not in public and "可以继续讨论。" in public
+    assert (
+        limit_questions("**谁接单？**（店员还是老板？）\n已保存。", asked=["谁接单？"])[0]
+        == "已保存。"
+    )
+
+
 @pytest.mark.parametrize("repair_succeeds", [True, False])
 async def test_record_protocol_repair_is_bounded_and_preserves_valid_facts(
     auth_api, monkeypatch, repair_succeeds

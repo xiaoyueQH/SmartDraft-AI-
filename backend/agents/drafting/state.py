@@ -72,9 +72,14 @@ class DraftState(BaseModel):
             "customer_statements": self.customer_statements,
             "role_terms": (self.plan.role_terms if self.plan else [])
             or self.business_notes.get("users", []),
+            "design_rules": self.plan.design_rules if self.plan else [],
             "public_references": [ref.model_dump() for ref in self.references],
             "draft_assumptions": [item.model_dump() for item in self.assumptions],
-            "previous_assumptions": [item.model_dump() for item in self.previous_assumptions],
+            "previous_assumptions": [
+                item.model_dump()
+                for item in self.previous_assumptions
+                if item not in self.assumptions
+            ],
             "priority": "本次客户要求与最新已保存事实优先；历史补充方案仅供沿用，不得覆盖客户要求",
             "existing_sections": [
                 {

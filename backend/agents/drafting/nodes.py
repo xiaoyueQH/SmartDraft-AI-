@@ -148,7 +148,12 @@ class DraftNodes:
             {
                 **state.context(),
                 "remaining_budget": runtime.remaining(),
-                "outline": state.plan.model_dump() if state.plan else None,
+                "outline": {
+                    "sections": [section.model_dump() for section in state.plan.sections],
+                    "pending_questions": state.plan.pending_questions,
+                }
+                if state.plan
+                else None,
                 "completed_sections": list(state.sections),
                 "failed_sections": state.failures,
             },

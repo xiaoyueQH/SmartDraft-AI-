@@ -138,8 +138,33 @@ class ReviewNodes:
             {"role": "user", "content": tool_json(data)},
             *state["messages"],
         ]
+        available_tools = [
+            tool
+            for tool in TOOLS
+            if tool["function"]["name"] != "read_blocks"
+            or any(block["id"] not in state["read_ids"] for block in state["blocks"])
+        ]
+        concluding = state["rounds"] >= self.runtime.settings.review_max_rounds - 2
+        if concluding:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "这是本轮最后一次提交结论的机会，剩余一次模型调用留给修订复核。"
+                        "请用finish_review提交已读内容中有依据的问题和精确局部修改，"
+                        "未读或未能修复的部分如实保留，不为完成而编造问题或宣称全部通过。"
+                    ),
+                }
+            )
         try:
-            message = await self.model(state, messages, TOOLS)
+            message = await self.model(
+                state,
+                messages,
+                available_tools,
+                tool_choice={"type": "function", "function": {"name": "finish_review"}}
+                if concluding
+                else None,
+            )
             calls = message.get("tool_calls") or []
             if not calls and state["rounds"] < self.runtime.settings.review_max_rounds - 1:
                 message = await self.model(
@@ -158,7 +183,7 @@ class ReviewNodes:
                             ),
                         },
                     ],
-                    TOOLS,
+                    available_tools,
                     tool_choice={"type": "function", "function": {"name": "finish_review"}},
                 )
                 calls = message.get("tool_calls") or []
@@ -249,7 +274,9 @@ class ReviewNodes:
         signature = hashlib.sha256(tool_json(call["function"]).encode()).hexdigest()
         if not result["ok"]:
             state.setdefault("stop_reasons", []).append(
-                "检查建议引用的内容不是客户原话，该建议未采用。"
+                "本次选择的章节数量不符合读取限制，请分批检查；原稿保持不变。"
+                if result.get("code") == "REVIEW_BLOCK_SELECTION"
+                else "检查建议引用的内容不是客户原话，该建议未采用。"
                 if any(
                     "source_quote" in row.get("message", "") for row in result.get("rejected", [])
                 )
@@ -263,7 +290,9 @@ class ReviewNodes:
             state["last_invalid_call"] = ""
         await self.store.event(
             self.review_id,
-            "已读取相关章节" if call["function"]["name"] == "read_blocks" else "已处理本次检查建议",
+            ("已读取相关章节" if result["ok"] else "本次章节读取未完成")
+            if call["function"]["name"] == "read_blocks"
+            else "已处理本次检查建议",
             type="tool",
             tool=call["function"]["name"],
             ok=result["ok"],

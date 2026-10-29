@@ -43,6 +43,19 @@ def tool_call(tools, state, name, arguments):
     return tools.call({"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}, state)
 
 
+def test_oversized_read_gives_actionable_batch_limit_and_can_recover():
+    blocks = split_markdown("\n\n".join(f"## 章节{i}\n内容{i}。" for i in range(5)))
+    ids = [block["id"] for block in blocks]
+    state = {"blocks": blocks, "read_ids": [], "findings": [], "changes": []}
+    tools = ReviewTools({"client_quotes": []})
+    result = tool_call(tools, state, "read_blocks", {"ids": ids})
+    assert not result["ok"] and result["code"] == "REVIEW_BLOCK_SELECTION"
+    assert "1至4" in result["message"] and not state["read_ids"]
+    assert tool_call(tools, state, "read_blocks", {"ids": ids[:4]})["ok"]
+    assert tool_call(tools, state, "read_blocks", {"ids": ids[4:]})["ok"]
+    assert state["read_ids"] == ids
+
+
 def test_patch_requires_read_evidence_and_exact_nonoverlapping_source():
     blocks = split_markdown(SOURCE)
     sid = blocks[1]["id"]
@@ -448,6 +461,38 @@ async def test_short_block_context_remains_available_after_a_tool_exchange():
         assert len(data["read_ids"]) == len(set(data["read_ids"]))
 
 
+async def test_final_assessment_reserves_submission_and_removes_exhausted_read_tool():
+    from types import SimpleNamespace
+
+    from backend.agents.review.nodes import ReviewNodes
+
+    runtime = SimpleNamespace(settings=SimpleNamespace(review_max_rounds=8, review_max_tools=16))
+    job = {"source": {"facts": {}, "client_quotes": [], "assumptions": []}}
+    nodes = ReviewNodes(runtime, None, None, None, None, None, job)
+    state = {
+        "rounds": 6,
+        "calls": 6,
+        "blocks": split_markdown(SOURCE),
+        "findings": [],
+        "changes": [],
+        "read_ids": [],
+        "messages": [],
+    }
+
+    async def model(state, messages, tools=None, **kwargs):
+        assert kwargs["tool_choice"]["function"]["name"] == "finish_review"
+        assert "read_blocks" not in [tool["function"]["name"] for tool in tools]
+        assert "未读或未能修复" in messages[-1]["content"]
+        state["rounds"] += 1
+        return {
+            "tool_calls": [{"id": "end", "function": {"name": "finish_review", "arguments": "{}"}}]
+        }
+
+    nodes.model = model
+    result = await nodes.assess(state)
+    assert result["rounds"] == 7 and result["pending"]
+
+
 async def test_repeated_invalid_review_stops_and_explains_incomplete_result(auth_api, monkeypatch):
     class InvalidModel:
         def __init__(self):
@@ -505,6 +550,7 @@ async def test_plain_review_response_gets_one_bounded_native_submission(auth_api
                     "total_tokens": 10
                 }
             assert kwargs["tool_choice"]["function"]["name"] == "finish_review"
+            assert "read_blocks" not in [tool["function"]["name"] for tool in kwargs["tools"]]
             data = json.loads(messages[1]["content"])
             sid = next(b["id"] for b in data["manifest"] if b["title"] == "取消预约")
             payload = {

@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
@@ -37,6 +37,11 @@ class DraftPlan(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
     sections: list[DraftSection] = Field(min_length=1, max_length=6)
     role_terms: list[str] = Field(default_factory=list, max_length=15)
+    design_rules: list[Annotated[str, Field(min_length=1, max_length=180)]] = Field(
+        default_factory=list,
+        max_length=8,
+        description="跨章节共用的简短设计约定：角色权限、表与字段命名、状态、时间边界、接口规则。不是客户确认事实；最新客户要求优先。",
+    )
     pending_questions: list[str] = Field(default_factory=list, max_length=30)
     assumptions: list[DraftAssumption] = Field(
         default_factory=list,

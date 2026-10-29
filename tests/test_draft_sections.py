@@ -129,6 +129,7 @@ async def test_agent_observes_tool_results_then_selects_next_action():
     assert written[0]["written_sections"] == {}
     decisions = [(system, data) for system, data, _ in flow.models if "DRAFT_AGENT" in system]
     assert all(data["remaining_budget"]["tokens"] == 64000 for _, data in decisions)
+    assert set(decisions[1][1]["outline"]) == {"sections", "pending_questions"}
     assert len(decisions[1][0].encode("utf-8")) < len(decisions[0][0].encode("utf-8")) // 2
 
 
@@ -320,6 +321,96 @@ def test_outline_validation_rejects_duplicate_section_ids():
         DraftPlan(sections=[SPECS[0], SPECS[0]])
 
 
+async def test_all_chapters_share_design_rules_and_late_replan_cannot_change_them():
+    rules = [
+        "预约表统一命名booking，状态active/cancelled。",
+        "取消立即释放资源；主题修改直接更新并记审计。",
+    ]
+    plan = {"sections": SPECS, "role_terms": ["店主", "员工"], "design_rules": rules}
+    flow = AgentFlow(
+        [
+            tools(call("plan_draft", plan), call("write_prd_section", {"section_id": "goals"})),
+            tools(
+                call("plan_draft", {**plan, "design_rules": ["改用reservation与另一套状态"]}),
+                call("write_prd_section", {"section_id": "functions"}),
+                call("finish_draft", {}),
+            ),
+        ]
+    )
+    result = await create_draft(flow, checkpointer=InMemorySaver())
+    assert not result["partial"]
+    writes = [data for system, data, _ in flow.models if "DRAFT_SECTION" in system]
+    assert len(writes) == 2 and all(data["design_rules"] == rules for data in writes)
+    assert any(event.get("tool") == "plan_draft" and not event["ok"] for event in flow.events)
+    # A separate invocation starts without the previous draft's design choices.
+    assert DraftState(business_notes=flow.notes).context()["design_rules"] == []
+
+
+def test_design_rules_are_bounded_and_optional_for_existing_checkpoints():
+    plan = DraftPlan(sections=SPECS)
+    assert not plan.design_rules
+    with pytest.raises(ValueError):
+        DraftPlan(sections=SPECS, design_rules=["x" * 181])
+    with pytest.raises(ValueError):
+        DraftPlan(sections=SPECS, design_rules=["x"] * 9)
+
+
+@pytest.mark.parametrize("heading", ["#", "##"])
+async def test_writer_drops_only_its_repeated_section_heading(heading):
+    flow = AgentFlow(
+        [
+            tools(
+                *plan_calls(),
+                call("write_prd_section", SPECS[0]),
+                call("write_prd_section", SPECS[1]),
+                call("finish_draft", {}),
+            )
+        ]
+    )
+    original = flow.model
+
+    async def model(system, data, **kwargs):
+        response = await original(system, data, **kwargs)
+        if "DRAFT_SECTION" in system:
+            response["content"] = (
+                heading + " " + data["current_section"]["title"] + "\n\n" + response["content"]
+            )
+        return response
+
+    flow.model = model
+    result = await create_draft(flow, checkpointer=InMemorySaver())
+    assert not result["partial"]
+    text = result["document"]["content"]
+    assert text.count("## 业务目标\n") == 1 and text.count("## 角色与功能\n") == 1
+    assert "### goals" in text and "### functions" in text
+
+
+async def test_standalone_first_chapter_also_freezes_effective_shared_design():
+    flow = AgentFlow(
+        [
+            tools(call("write_prd_section", SPECS[0])),
+            tools(
+                call(
+                    "plan_draft",
+                    {
+                        "sections": SPECS,
+                        "design_rules": ["新表名和新状态"],
+                        "role_terms": ["管理员"],
+                    },
+                ),
+                call("write_prd_section", SPECS[1]),
+                call("finish_draft", {}),
+            ),
+        ]
+    )
+    result = await create_draft(flow, checkpointer=InMemorySaver())
+    assert not result["partial"]
+    writes = [data for system, data, _ in flow.models if "DRAFT_SECTION" in system]
+    assert len(writes) == 2 and all(data["design_rules"] == [] for data in writes)
+    assert all(data["role_terms"] == flow.notes["users"] for data in writes)
+    assert any(event.get("tool") == "plan_draft" and not event["ok"] for event in flow.events)
+
+
 async def test_oversized_native_batch_keeps_completed_actions_within_actual_tool_budget():
     flow = AgentFlow(
         [
@@ -451,6 +542,18 @@ async def test_auto_choices_are_saved_as_proposals_not_customer_facts():
     assert "technology_preference" not in flow.notes
     assert flow.notes == original_notes
     assert result["document"]["questions"] == []
+
+
+def test_context_deduplicates_current_proposals_without_losing_older_different_choices():
+    from backend.models.drafting import DraftAssumption
+
+    chosen = DraftAssumption(category="technology", topic="数据库", value="PostgreSQL")
+    older = DraftAssumption(category="technology", topic="数据库", value="SQLite")
+    state = DraftState(assumptions=[chosen], previous_assumptions=[chosen, older])
+    context = state.context()
+    assert context["draft_assumptions"] == [chosen.model_dump()]
+    assert context["previous_assumptions"] == [older.model_dump()]
+    assert state.previous_assumptions == [chosen, older]
 
 
 async def test_explicit_customer_stack_removes_old_auto_technology_from_context():

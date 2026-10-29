@@ -313,23 +313,82 @@ def question_key(text):
     return re.sub(r"[\W_]+", "", re.sub(r"^\s*(?:[-*]|\d+[.、])\s*", "", text)).lower()
 
 
+_REPLY_LITERAL = re.compile(
+    r"```[\s\S]*?(?:```|\Z)|`[^`\n]*(?:`|\Z)|https?://[^\s<>。！？)\]]+"
+    r"|“[^”]*”|「[^」]*」|『[^』]*』"
+)
+
+
+def reply_units(reply):
+    """Keep bracketed explanations, quoted endings and code with their sentence."""
+    pairs = {"（": "）", "(": ")", "[": "]", "【": "】"}
+    units, stack = [], []
+    start = index = 0
+    while index < len(reply):
+        literal = _REPLY_LITERAL.match(reply, index)
+        if literal:
+            index = literal.end()
+            continue
+        char = reply[index]
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        index += 1
+        if not stack and char in "。！？!?\n":
+            while index < len(reply) and reply[index] in "”’」』":
+                index += 1
+            for marker in ("**", "__"):
+                if reply[start:index].count(marker) % 2 and reply.startswith(marker, index):
+                    index += len(marker)
+            units.append(reply[start:index])
+            start = index
+    if start < len(reply):
+        units.append(reply[start:])
+    # Parenthesized options immediately following a question belong to that question,
+    # including a single line break. Removing a repeated question removes its options too.
+    combined = []
+    for unit in units:
+        if (
+            combined
+            and unit.lstrip().startswith(("（", "("))
+            and re.search(r"[?？][”’」』]*(?:\*\*|__)?\s*$", combined[-1])
+            and not combined[-1].endswith("\n\n")
+        ):
+            combined[-1] += unit
+        elif unit.isspace() and combined:
+            combined[-1] += unit
+        else:
+            combined.append(unit)
+    return combined
+
+
 def limit_questions(reply, asked=(), *, limit=2):
     """Bound public questions without another model call; preserve declarative sentences."""
-    known = {question_key(item) for item in asked}
+
+    def identity(text):
+        return question_key(re.split(r"[?？]", text, maxsplit=1)[0])
+
+    known = {identity(item) for item in asked}
     output, questions = [], []
-    for part in re.findall(r"[^。！？!?\n]+[。！？!?]?|\n+", reply):
-        questioning = part.rstrip().endswith(("?", "？")) or bool(
+    used = 0
+    for part in reply_units(reply):
+        visible = _REPLY_LITERAL.sub("", part).rstrip()
+        marks = len(re.findall(r"[?？]", visible))
+        questioning = bool(marks) or bool(
             re.search(
                 r"(?:请问|请告诉|请介绍|请说明|请描述|请分享|能否|是否|有没有|怎样|如何|什么|哪些)",
-                part,
+                visible,
             )
-            and not part.rstrip().endswith(("。", "！", "!"))
+            and not visible.endswith(("。", "！", "!"))
         )
         if questioning:
-            key = question_key(part)
-            if len(questions) >= limit or key in known:
+            key = identity(visible)
+            cost = max(1, marks)
+            if used + cost > limit or key in known:
                 continue
             known.add(key)
+            used += cost
             questions.append(part.strip())
         output.append(part)
     return re.sub(r"\n{3,}", "\n\n", "".join(output)).strip(), questions

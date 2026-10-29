@@ -105,7 +105,14 @@ class ReviewTools:
                     or not isinstance(args["ids"], list)
                     or not 1 <= len(args["ids"]) <= 4
                 ):
-                    raise ValueError("Invalid block selection")
+                    return {
+                        "ok": False,
+                        "code": "REVIEW_BLOCK_SELECTION",
+                        "message": (
+                            "每次只能读取1至4个块ID；超过4个请拆成多次read_blocks调用，"
+                            "不要重复本次参数。"
+                        ),
+                    }
                 rows = [by_id[sid] for sid in dict.fromkeys(args["ids"])]
                 if sum(len(row["content"]) for row in rows) > 24000:
                     return {"ok": False, "message": "本批内容较长，请减少读取块数。"}
