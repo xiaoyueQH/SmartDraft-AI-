@@ -60,6 +60,8 @@ python scripts/create_user.py admin --role admin --display-name 管理员
 python scripts/start_api.py
 ```
 
+另一个终端启动独立执行进程：`python scripts/start_worker.py`。API只受理和查询，Worker负责模型任务；两者都需要运行。
+
 `create_user.py`只在首次需要管理员时执行，密码通过隐藏交互输入（至少12字符）；启动器不自动创建示例账号。其他账号由管理员开通。
 
 另一个终端启动前端：
@@ -70,7 +72,7 @@ npm ci
 npm run dev
 ```
 
-Compose当前只提供PostgreSQL和Redis；API与前端分别通过上面的本机命令启动，不是Docker全栈部署。
+Compose当前只提供PostgreSQL和Redis；API、Worker与前端分别通过上面的本机命令启动，不是Docker全栈部署。
 
 | 服务 / 页面 | 默认地址                                 |
 | ----------- | ---------------------------------------- |
@@ -78,6 +80,7 @@ Compose当前只提供PostgreSQL和Redis；API与前端分别通过上面的本�
 | 管理后台    | http://127.0.0.1:5183/#/admin            |
 | API文档     | http://127.0.0.1:8091/docs               |
 | 存活 / 就绪 | /api/health/live、/api/health/ready      |
+| Worker就绪 | /api/health/worker（无可用进程返回503） |
 | PostgreSQL  | 127.0.0.1:15432，库和用户默认supportflow |
 | Redis       | 127.0.0.1:16379                          |
 
@@ -127,7 +130,7 @@ Python依赖唯一来源为requirements.txt，pyproject.toml与environment.yml�
 
 修改时先运行受影响检查，通过后不重复整套。具体命令、模拟与实测的区别见[验证指南](docs/验证指南.md)。
 
-每进程默认4个后台Agent名额；持久数据与鉴权在PostgreSQL。当前后台任务在API进程内运行，没有持久队列或重启后的自动调度。刷新可恢复查询，需求沟通有HITL，起草支持同次执行的检查点重入，三者的恢复范围不能混为一谈。
+PostgreSQL持久任务队列与独立Worker负责Agent执行，默认全局4个运行名额；API重启不取消独立Worker，未开始任务可继续领取。已开始任务失联后核对业务回执，结果未知时安全失败，不自动重复付费调用。详见[任务队列与Worker](docs/任务队列与Worker.md)。
 
 详细稿中的SQL、配置和设计指标是待评审方案，生成成功不代表实际开发或实测成功。当前没有附件解析、向量RAG、Skill/MCP调用、代码仓库集成和真实外部交付自动化；新增能力按真实需求实现。
 

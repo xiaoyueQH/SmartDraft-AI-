@@ -27,7 +27,7 @@ consultations_router = APIRouter(prefix="/consultations", tags=["requirement-dis
 
 
 def project_store(database: DatabaseDep, cache: CacheDep, settings: SettingsDep):
-    return ConversationStore(database, cache, settings.recovery)
+    return ConversationStore(database, cache, settings.recovery, settings.queue)
 
 
 StoreDep = Annotated[ConversationStore, Depends(project_store)]
@@ -150,18 +150,11 @@ async def message(
         result = await store.send_chat(principal, project_id, data)
         await agent.try_facts(store, principal, project_id)
         return result
-    agent.reserve()
-    try:
-        run, created = await store.start_run(
-            principal, project_id, data, conversation_version=delivery["version"]
-        )
-    except BaseException:
-        agent.release()
-        raise
-    if created:
-        agent.launch(store, principal, project_id, UUID(run["id"]), data.content)
-    else:
-        agent.release()
+    if not agent.configured:
+        raise ProjectError("AGENT_NOT_CONFIGURED", "业务顾问暂时不可用，请联系负责人。", 503)
+    run, _ = await store.start_run(
+        principal, project_id, data, conversation_version=delivery["version"]
+    )
     return run
 
 

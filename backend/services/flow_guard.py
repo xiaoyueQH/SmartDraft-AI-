@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from datetime import timedelta
-from uuid import UUID
 
 from sqlalchemy import or_, select
 
@@ -14,13 +13,13 @@ from backend.models.auth import Principal
 from backend.models.orm import LoginSession, User
 from backend.models.projects import (
     Project,
-    ProjectError,
     ProjectItem,
     ProjectMessage,
     ProjectRun,
     SendMessage,
 )
 from backend.models.review import DocumentReview
+from backend.services.job_worker import reconcile_jobs
 
 logger = logging.getLogger("supportflow.recovery")
 
@@ -28,7 +27,8 @@ logger = logging.getLogger("supportflow.recovery")
 class FlowGuard:
     def __init__(self, database, cache, agent, settings):
         self.database, self.cache, self.agent, self.settings = database, cache, agent, settings
-        self.store = ConversationStore(database, cache, settings)
+        self.queue = getattr(agent, "queue_settings", None)
+        self.store = ConversationStore(database, cache, settings, self.queue)
         self.cursor = None
         self.task = None
 
@@ -52,6 +52,7 @@ class FlowGuard:
             await asyncio.sleep(self.settings.scan_seconds)
 
     async def tick(self):
+        await reconcile_jobs(self.database, self.cache, self.settings, self.queue)
         clock = now()
         stale = clock - timedelta(seconds=self.settings.stalled_run_seconds)
         async with self.database.session() as session:
@@ -210,25 +211,13 @@ class FlowGuard:
                 clear=False,
             )
             return
-        try:
-            self.agent.reserve()
-        except ProjectError:
-            return  # Capacity shortages leave the durable pending reply for a later pass.
-        try:
-            result, created = await self.store.start_run(
-                principal,
-                pid,
-                SendMessage(request_id=rid, content=content),
-                conversation_version=version,
-                source_message_id=mid,
-            )
-        except BaseException:
-            self.agent.release()
-            raise
-        if created:
-            self.agent.launch(self.store, principal, pid, UUID(result["id"]), content)
-        else:
-            self.agent.release()
+        await self.store.start_run(
+            principal,
+            pid,
+            SendMessage(request_id=rid, content=content),
+            conversation_version=version,
+            source_message_id=mid,
+        )
 
     async def park_reply(self, pid, mid, rid, reason, message, *, clear):
         async with self.database.session() as session:

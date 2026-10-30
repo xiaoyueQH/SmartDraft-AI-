@@ -5,7 +5,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from test_auth import auth_api, headers, login  # noqa: F401
 from test_human_conversation import control, send_chat
 from test_postgresql import postgres, postgres_auth  # noqa: F401
@@ -15,6 +15,7 @@ from backend.agents.runtime import AgentRuntime
 from backend.config import AgentSettings, RecoverySettings
 from backend.db.conversation_store import ConversationStore
 from backend.db.project_store import append_message, now
+from backend.models.jobs import AgentJob
 from backend.models.orm import LoginSession
 from backend.models.projects import (
     ConversationAction,
@@ -293,6 +294,8 @@ async def test_stalled_partial_answer_is_not_misreported_as_completed_and_review
         row = await session.get(Project, UUID(p["id"]))
         row.consultation = {"discussion_run_id": run["id"]}
         task = await session.get(ProjectRun, UUID(run["id"]))
+        # Legacy run created before the durable queue migration has no queue owner.
+        await session.execute(delete(AgentJob).where(AgentJob.target_id == task.id))
         task.created_at = now() - timedelta(minutes=4)
         task.answer = "本轮沟通已保存，正在生成需求。"
         append_message(session, row, task.answer, "ai", run_id=task.id)

@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from backend.config import DatabaseSettings
+from backend.core.job_context import job_lease
 
 
 class Database:
@@ -20,7 +21,50 @@ class Database:
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.session_factory.begin() as session:
+            lease = job_lease.get()
+            if lease is not None:
+                await self._check_lease(session, lease)
             yield session
+            if lease is not None:
+                # The body may wait for a business row lock. An expired owner must
+                # roll back even if it entered the transaction before expiry.
+                await self._check_lease(session, lease)
+
+    @staticmethod
+    async def _check_lease(session, lease):
+        from datetime import UTC, datetime
+
+        from sqlalchemy import func
+
+        from backend.models.jobs import AgentJob
+        from backend.models.projects import ProjectError
+
+        statement = (
+            select(AgentJob.status, AgentJob.token, AgentJob.lease_until)
+            .where(AgentJob.id == lease.job_id)
+            .with_for_update(read=True)
+        )
+        row = (await session.execute(statement)).one_or_none()
+        expires = (
+            row.lease_until.replace(tzinfo=UTC)
+            if row and row.lease_until and row.lease_until.tzinfo is None
+            else (row.lease_until if row else None)
+        )
+        checked_at = (
+            await session.scalar(select(func.clock_timestamp()))
+            if session.get_bind().dialect.name == "postgresql"
+            else datetime.now(UTC)
+        )
+        if (
+            not row
+            or row.status != "running"
+            or row.token != lease.token
+            or not expires
+            or expires <= checked_at
+        ):
+            raise ProjectError(
+                "TASK_LEASE_LOST", "本次处理已交由系统收尾，旧执行不能继续保存。", 409
+            )
 
     async def ping(self) -> None:
         async with self.session() as session:

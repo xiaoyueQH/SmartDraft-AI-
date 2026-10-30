@@ -6,11 +6,14 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_, select
 
+from backend.config import QueueSettings
 from backend.db.identity import lock_identity
+from backend.db.job_store import enqueue, protected
 from backend.db.session import Database
 from backend.models.auth import Principal
 from backend.models.consultation import ConsultationState, FactEvidence
 from backend.models.discovery import merge_discovery
+from backend.models.jobs import AgentJob
 from backend.models.orm import User
 from backend.models.projects import (
     CreateItem,
@@ -128,9 +131,10 @@ async def remember_revision(session, row, actor_id, action, blocks=None):
 
 
 class ProjectStore:
-    def __init__(self, database: Database, cache=None):
+    def __init__(self, database: Database, cache=None, queue=None):
         self.database = database
         self.cache = cache
+        self.queue = queue or QueueSettings()
 
     @asynccontextmanager
     async def _write_session(self):
@@ -282,6 +286,17 @@ class ProjectStore:
                     raise ProjectError("VERSION_CONFLICT", "记录内容已更新，请刷新列表后重新确认")
                 if (row.deleted_at is not None) != (data.action == "restore"):
                     raise ProjectError("INVALID_STATE", "记录状态已变化，请刷新列表")
+            if await session.scalar(
+                select(AgentJob.id)
+                .where(
+                    AgentJob.project_id.in_(targets),
+                    AgentJob.status.in_(["queued", "running"]),
+                )
+                .limit(1)
+            ):
+                raise ProjectError(
+                    "PROJECT_BUSY", "选中记录有请求等待或正在处理，请完成后再管理。", 409
+                )
             runs = list(
                 await session.scalars(
                     select(ProjectRun)
@@ -296,7 +311,9 @@ class ProjectStore:
                     if run.created_at.tzinfo is None
                     else run.created_at
                 )
-                if now() - started <= timedelta(seconds=180):
+                if now() - started <= timedelta(seconds=180) or await protected(
+                    session, "run", run.id
+                ):
                     raise ProjectError("PROJECT_BUSY", "选中记录有顾问正在处理，请等待完成后再管理")
                 run.status, run.answer = "failed", "上次执行已中断，请恢复记录后重新发送。"
             for row in rows:
@@ -909,7 +926,11 @@ class ProjectStore:
                 if row.created_at.tzinfo is None
                 else row.created_at
             )
-            if row.status == "running" and now() - started > timedelta(seconds=180):
+            if (
+                row.status == "running"
+                and now() - started > timedelta(seconds=180)
+                and not await protected(session, "run", row.id)
+            ):
                 await self._recover_run(session, project, row)
             return self.run_view(row)
 
@@ -961,7 +982,9 @@ class ProjectStore:
                     if active.created_at.tzinfo is None
                     else active.created_at
                 )
-                if now() - started <= timedelta(seconds=180):
+                if now() - started <= timedelta(seconds=180) or await protected(
+                    session, "run", active.id
+                ):
                     raise ProjectError(
                         "PROJECT_BUSY", "项目已有 Agent 正在处理，请等待当前结果", 409
                     )
@@ -1017,6 +1040,8 @@ class ProjectStore:
                     created_at=run.created_at,
                     login_session_id=principal.session_id,
                 )
+            await enqueue(session, principal, project_id, run.id, settings=self.queue)
+            run.events = [{"type": "queue", "summary": "请求已保存，等待处理", "sequence": 1}]
             await session.flush()
             return self.run_view(run), True
 
@@ -1317,7 +1342,7 @@ class ProjectStore:
         )
         run.status = "completed" if committed else "failed"
         if committed:
-            run.answer = run.answer or assistant.content
+            run.answer = assistant.content
         elif run.options.get("silent"):
             project.extraction_error = "信息整理已中断，原话已保存，请重新整理。"
             project.extraction_started_at = now()

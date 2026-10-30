@@ -8,6 +8,7 @@ from sqlalchemy.orm import aliased
 
 from backend.config import RecoverySettings
 from backend.db.identity import lock_identity
+from backend.db.job_store import enqueue, protected
 from backend.db.project_store import ProjectStore, append_message, fingerprint, now, view
 from backend.models.consultation import ConsultationState, FactEvidence
 from backend.models.discovery import merge_discovery
@@ -26,8 +27,8 @@ from backend.models.review import DocumentReview
 
 
 class ConversationStore(ProjectStore):
-    def __init__(self, database, cache=None, recovery=None):
-        super().__init__(database, cache)
+    def __init__(self, database, cache=None, recovery=None, queue=None):
+        super().__init__(database, cache, queue)
         self.recovery = recovery or RecoverySettings()
 
     @staticmethod
@@ -404,6 +405,8 @@ class ConversationStore(ProjectStore):
             )
         )
         for row in old_runs:
+            if await protected(session, "run", row.id):
+                continue
             project = await session.get(Project, project_id)
             await self._recover_run(session, project, row)
         old_reviews = list(
@@ -418,6 +421,8 @@ class ConversationStore(ProjectStore):
             )
         )
         for row in old_reviews:
+            if await protected(session, "review", row.id):
+                continue
             row.status, row.error = "failed", "上次检查已中断，原稿和已完成内容已保留。"
         await session.flush()
         return bool(
@@ -956,7 +961,11 @@ class ConversationStore(ProjectStore):
                 actor_id=principal.account.id,
                 request_id=uuid4(),
                 prompt="",
-                options={"silent": True},
+                options={
+                    "silent": True,
+                    "fact_version": project.version,
+                    "fact_through": project.extraction_until,
+                },
                 status="running",
                 events=[],
                 answer="",
@@ -964,10 +973,37 @@ class ConversationStore(ProjectStore):
             )
             session.add(run)
             await session.flush()
+            await enqueue(session, principal, project_id, run.id, settings=self.queue)
             return {
                 "run_id": str(run.id),
                 "version": project.version,
                 "through": project.extraction_until,
+                "messages": [view(row) for row in rows],
+                "project": view(project),
+            }
+
+    async def load_facts(self, principal, project_id, run):
+        async with self.database.session() as session:
+            project, _ = await self._project(session, principal, project_id)
+            if project.version != run.options["fact_version"]:
+                raise ProjectError("VERSION_CONFLICT", "业务信息已变化，请重新整理", 409)
+            rows = list(
+                await session.scalars(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.sender_type == "customer",
+                        ProjectMessage.sequence > project.facts_cursor,
+                        ProjectMessage.sequence <= run.options["fact_through"],
+                    )
+                    .order_by(ProjectMessage.sequence)
+                    .limit(8)
+                )
+            )
+            return {
+                "run_id": str(run.id),
+                "version": project.version,
+                "through": run.options["fact_through"],
                 "messages": [view(row) for row in rows],
                 "project": view(project),
             }

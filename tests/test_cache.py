@@ -8,15 +8,17 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 from redis.exceptions import ConnectionError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from test_auth import auth_api, headers, login  # noqa: F401
 from test_postgresql import postgres, postgres_auth  # noqa: F401
 from test_projects import project
 
 from backend.config import CacheSettings
 from backend.db.cache import ReadCache
+from backend.db.job_store import JobStore
 from backend.db.project_store import ProjectStore
 from backend.dependencies import get_read_cache
+from backend.models.jobs import AgentJob
 from backend.models.projects import ProjectError, ProjectRun, SendMessage, StartConsultation
 
 
@@ -141,13 +143,13 @@ async def test_snapshot_version_and_access_are_checked_before_cache(auth_api, ca
     rid = UUID(run["id"])
     url = f"/api/projects/{pid}/runs/{rid}"
     for _ in range(2):
-        assert (await client.get(url, headers=identity)).json()["events"] == []
+        assert (await client.get(url, headers=identity)).json()["events"] == run["events"]
     assert cache.counters["hits"] == 1
     other = headers(await login(client, "bob"))
     assert (await client.get(url, headers=other)).status_code == 404
     assert cache.counters["hits"] == 1
     await store.event(rid, {"type": "node", "summary": "处理业务"})
-    assert len((await client.get(url, headers=identity)).json()["events"]) == 1
+    assert len((await client.get(url, headers=identity)).json()["events"]) == 2
     await store.finish(
         principal,
         pid,
@@ -175,9 +177,17 @@ async def test_snapshot_version_and_access_are_checked_before_cache(auth_api, ca
             async with database.session() as session:
                 row = await session.get(ProjectRun, rid)
                 row.created_at = datetime.now(UTC) - timedelta(seconds=181)
+                await session.execute(delete(AgentJob).where(AgentJob.target_id == rid))
         else:
             await store.fail(rid, "处理失败")
         assert (await client.get(next_url, headers=identity)).json()["status"] == "failed"
+    # The graph results above were supplied directly; acknowledge their queue references too.
+    jobs = JobStore(database)
+    while job := await jobs.claim("cache-fixture", 4):
+        async with database.session() as session:
+            status = (await session.get(ProjectRun, job.target_id)).status
+        assert status in {"completed", "failed"}
+        await jobs.finish(job.id, job.token, status)
     current = (await client.get(f"/api/projects/{pid}", headers=identity)).json()["project"]
     deleted = await client.post(
         "/api/projects/records/actions",

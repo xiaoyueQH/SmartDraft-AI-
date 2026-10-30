@@ -3,6 +3,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import literal, or_, select, union_all
 
+from backend.db.job_store import enqueue, protected
 from backend.db.project_store import ProjectStore, fingerprint, now, remember_revision, view
 from backend.models.projects import Project, ProjectError, ProjectItem, ProjectMessage, ProjectRun
 from backend.models.review import DocumentReview, DocumentRevision, content_hash
@@ -178,7 +179,9 @@ class ReviewStore(ProjectStore):
                     if active.created_at.tzinfo is None
                     else active.created_at
                 )
-                if now() - started < timedelta(seconds=180):
+                if now() - started < timedelta(seconds=180) or await protected(
+                    session, "review", active.id
+                ):
                     raise ProjectError("REVIEW_BUSY", "这份文档正在检查，请等待结果")
                 active.status, active.error = "failed", "上次检查已中断，原稿未改变。"
                 await session.flush()
@@ -246,17 +249,47 @@ class ReviewStore(ProjectStore):
             )
             session.add(row)
             await session.flush()
+            await enqueue(
+                session,
+                principal,
+                project_id,
+                row.id,
+                kind="review",
+                item_id=item_id,
+                settings=self.queue,
+            )
+            row.events = [{"type": "queue", "summary": "检查请求已保存，等待处理", "sequence": 1}]
             return self.review_view(row), True
 
     async def load(self, principal, project_id, item_id, review_id, internal=False):
         async with self.database.session() as session:
             await self._document(session, principal, project_id, item_id)
             row = await self._review(session, project_id, item_id, review_id, True)
-            self.recover_stale(row)
+            await self.recover_stale(session, row)
             return self.review_view(row, internal)
 
+    async def validate_execution(self, principal, project_id, item_id, review_id):
+        """Do not spend model calls on a source edited while its job was waiting."""
+        async with self.database.session() as session:
+            project, _, document = await self._document(session, principal, project_id, item_id)
+            row = await self._review(session, project_id, item_id, review_id)
+            if row.status != "running":
+                raise ProjectError("REVIEW_STATE_CHANGED", "检查状态已变化，请查看最新结果", 409)
+            if (
+                document.version != row.source["version"]
+                or project.version != row.source["project_version"]
+                or content_hash(document.content) != row.source["hash"]
+            ):
+                raise ProjectError(
+                    "VERSION_CONFLICT",
+                    "等待期间资料已更新，请按最新内容重新检查，原稿保持不变。",
+                    409,
+                )
+
     @staticmethod
-    def recover_stale(row):
+    async def recover_stale(session, row):
+        if await protected(session, "review", row.id):
+            return
         started = (
             row.created_at.replace(tzinfo=UTC) if row.created_at.tzinfo is None else row.created_at
         )
@@ -274,7 +307,7 @@ class ReviewStore(ProjectStore):
                 .with_for_update()
             )
             if row:
-                self.recover_stale(row)
+                await self.recover_stale(session, row)
             return self.review_view(row) if row else None
 
     async def event(self, review_id, summary, **extra):

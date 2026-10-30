@@ -17,6 +17,7 @@ from backend.agents.consultation.state import verified_patch
 from backend.agents.runtime import AgentRuntime
 from backend.config import AgentSettings
 from backend.db.checkpoints import DatabaseCheckpointer
+from backend.db.job_store import JobStore
 from backend.db.project_store import ProjectStore, now
 from backend.db.review_store import ReviewStore
 from backend.models.consultation import ConsultationState, Extraction, FactEvidence
@@ -144,6 +145,12 @@ async def test_fact_evidence_outlives_working_sources_and_detects_changed_origin
             consultation=ConsultationState(sources=sources).model_dump(mode="json"),
             expected_version=snapshot["project"]["version"],
         )
+        # This test supplies the graph result directly; acknowledge its queued task too.
+        jobs = JobStore(database)
+        claimed = await jobs.claim("fact-evidence-test", 4)
+        assert claimed.target_id == UUID(run["id"])
+        assert await jobs.finish(claimed.id, claimed.token, "completed")
+
     async with database.session() as session:
         assert await session.scalar(select(func.count()).select_from(FactEvidence)) == 120
         old = await session.scalar(select(FactEvidence).order_by(FactEvidence.created_at).limit(1))

@@ -15,9 +15,10 @@ from test_postgresql import postgres, postgres_auth  # noqa: F401
 from test_projects import project, wait_run
 
 from backend.agents.runtime import AgentRuntime
-from backend.config import AgentSettings, RecoverySettings
+from backend.config import AgentSettings, RecoverySettings, Settings
 from backend.db.conversation_store import ConversationStore
 from backend.db.project_store import now
+from backend.models.jobs import AgentJob
 from backend.models.projects import (
     ConversationAction,
     Project,
@@ -28,6 +29,7 @@ from backend.models.projects import (
     StartConsultation,
 )
 from backend.services.flow_guard import FlowGuard
+from backend.services.job_worker import JobWorker
 
 pg_only = pytest.mark.skipif(
     os.environ.get("SUPPORTFLOW_TEST_POSTGRES") != "1", reason="local PG opt-in"
@@ -266,20 +268,16 @@ async def test_competing_recovery_dispatch_creates_one_run_for_original_message(
         row = await session.get(Project, pid)
         row.support_wait_since = now() - timedelta(minutes=4)
     monkeypatch.setattr(AgentRuntime, "configured", property(lambda self: True))
-    launched = []
-
-    def launch(self, store, actor, project_id, run_id, content):
-        launched.append((project_id, run_id, actor.session_id))
-        self.release()
-
-    monkeypatch.setattr(AgentRuntime, "launch", launch)
     agents = [AgentRuntime(AgentSettings()), AgentRuntime(AgentSettings())]
     guards = [FlowGuard(database, None, agent, RecoverySettings()) for agent in agents]
     try:
         await guards[0].reconcile(pid)
         await asyncio.gather(*(guard.dispatch(pid) for guard in guards))
         await asyncio.gather(*(guard.dispatch(pid) for guard in guards))
-        assert len(launched) == 1 and launched[0][2] == customer.session_id
+        async with database.session() as session:
+            jobs = list(await session.scalars(select(AgentJob).where(AgentJob.project_id == pid)))
+            assert len(jobs) == 1 and jobs[0].session_id == customer.session_id
+            assert jobs[0].status == "queued" and jobs[0].attempts == 0
         async with database.session() as session:
             runs = list(
                 await session.scalars(select(ProjectRun).where(ProjectRun.project_id == pid))
@@ -330,6 +328,18 @@ async def test_new_human_messages_during_ai_handover_remain_unanswered(auth_api,
         assert row.answered_through < message.sequence and message.run_id is None
         assert now() - ConversationStore.utc(row.support_wait_since) < timedelta(seconds=5)
     await send_chat(client, staff, pid, "收到，将按这个权限要求整理。")
+    # Silent fact extraction is now durable too; do not interrupt that accepted task.
+    for _ in range(100):
+        async with database.session() as session:
+            pending = await session.scalar(
+                select(ProjectRun.id)
+                .where(ProjectRun.project_id == UUID(pid), ProjectRun.status == "running")
+                .limit(1)
+            )
+        if not pending:
+            break
+        await asyncio.sleep(0.02)
+    assert not pending
     await control(client, staff, pid, "release")
     async with database.session() as session:
         row = await session.get(Project, UUID(pid))
@@ -445,8 +455,10 @@ async def test_parallel_agent_graphs_keep_messages_previews_and_threads_isolated
             )
             assert created
             runs.append(UUID(run["id"]))
-            agent.reserve()
-            agent.launch(store, actor, pid, runs[-1], text)
+        worker = JobWorker(
+            store.database, None, Settings(_env_file=None, agent=agent.settings), runtime=agent
+        )
+        await worker.tick()
         await asyncio.wait_for(both_entered.wait(), 4)
         for index, rid in enumerate(runs):
             preview = await agent.preview(store, rid)

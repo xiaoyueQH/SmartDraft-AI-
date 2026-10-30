@@ -9,6 +9,7 @@ from backend.agents.consultation.graph import ConsultationWorkflow, run_fact_gra
 from backend.agents.project.graph import ProjectWorkflow
 from backend.agents.review.graph import run_review
 from backend.config import AgentSettings, RecoverySettings
+from backend.core.job_context import job_lease
 from backend.core.llm.factory import ModelFactory
 from backend.core.llm.models import ModelError, ModelPurpose
 from backend.db.checkpoints import DatabaseCheckpointer
@@ -34,34 +35,22 @@ class AgentRuntime:
     async def try_facts(self, store, principal, project_id):
         if self.closing:
             return
-        if (
-            project_id in self.fact_claims
-            or not self.configured
-            or self.active >= self.settings.capacity
-        ):
+        if project_id in self.fact_claims or not self.configured:
             return
         self.fact_claims.add(project_id)
-        reserved = False
         try:
-            self.reserve()
-            reserved = True
             chat = ConversationStore(
-                store.database, store.cache, getattr(store, "recovery", self.recovery)
+                store.database,
+                store.cache,
+                getattr(store, "recovery", self.recovery),
+                getattr(store, "queue", None),
             )
-            job = await chat.claim_facts(principal, project_id)
-            if not job:
-                return
-            task = asyncio.create_task(self.execute_facts(chat, principal, project_id, job))
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
-            reserved = False
+            await chat.claim_facts(principal, project_id)
         except Exception as error:
             logger.warning(
                 "fact_claim_deferred project_id=%s error_type=%s", project_id, type(error).__name__
             )
         finally:
-            if reserved:
-                self.release()
             self.fact_claims.discard(project_id)
 
     async def execute_facts(self, store, principal, project_id, job):
@@ -86,7 +75,10 @@ class AgentRuntime:
     async def settle_conversation(self, store, project_id):
         try:
             await ConversationStore(
-                store.database, store.cache, getattr(store, "recovery", self.recovery)
+                store.database,
+                store.cache,
+                getattr(store, "recovery", self.recovery),
+                getattr(store, "queue", None),
             ).settle(project_id)
         except Exception as error:
             logger.warning(
@@ -157,18 +149,6 @@ class AgentRuntime:
 
     def release(self):
         self.active -= 1
-
-    def launch(self, store, principal, project_id, run_id, prompt):
-        task = asyncio.create_task(self.execute(store, principal, project_id, run_id, prompt))
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
-
-    def launch_review(self, store, principal, project_id, item_id, review_id):
-        task = asyncio.create_task(
-            self.execute_review(store, principal, project_id, item_id, review_id)
-        )
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
 
     async def execute_review(self, store, principal, project_id, item_id, review_id):
         try:
@@ -296,6 +276,8 @@ class AgentRuntime:
         tool_choice=None,
         max_attempts=1,
     ):
+        if job_lease.get() is not None:
+            await self.execution_database.ping()
         if len(tool_json(messages)) > 100000:
             raise ProjectError("CONTEXT_BUDGET", "资料超出本轮预算，请按模块分别整理", 503)
         try:

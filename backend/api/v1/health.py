@@ -5,6 +5,7 @@ from typing import Literal
 from fastapi import APIRouter, Response
 from pydantic import BaseModel
 
+from backend.db.job_store import JobStore
 from backend.dependencies import DatabaseDep, SettingsDep
 
 router = APIRouter(prefix="/health", tags=["health"])
@@ -39,3 +40,21 @@ async def readiness(response: Response, database: DatabaseDep, settings: Setting
         response.status_code = 503
         return Readiness(status="not_ready", checks={"postgresql": "unavailable"})
     return Readiness(status="ready", checks={"postgresql": "ok"})
+
+
+@router.get("/worker", response_model=Readiness, responses={503: {"model": Readiness}})
+async def worker_readiness(
+    response: Response, database: DatabaseDep, settings: SettingsDep
+) -> Readiness:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        async with asyncio.timeout(settings.database.health_timeout_seconds):
+            available = await JobStore(database, settings.queue).available()
+    except Exception:
+        available = False
+    if not available:
+        response.status_code = 503
+    return Readiness(
+        status="ready" if available else "not_ready",
+        checks={"worker": "ok" if available else "unavailable"},
+    )

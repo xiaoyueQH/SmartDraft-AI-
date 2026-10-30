@@ -5,6 +5,7 @@ import type { AgentEvent, AgentRun } from "../api/projects";
 const props = defineProps<{ run: AgentRun }>();
 const labels: Record<string, string> = {
   model: "模型调用",
+  queue: "处理进度",
   tool: "工具调用",
   skill: "扩展功能",
   mcp: "外部服务",
@@ -49,13 +50,17 @@ const steps: Record<string, string> = {
 };
 function description(event: AgentEvent): string {
   const text =
-    event.type === "model"
-      ? "调用模型，整理您的需求"
-      : event.type === "saved"
-        ? "本轮沟通内容已保存"
-        : event.type === "node"
-          ? steps[event.node || ""] || "整理本次沟通信息"
-          : tools[event.tool || ""] || "使用业务工具处理本次请求";
+    event.type === "queue"
+      ? event.sequence === 1
+        ? "请求已保存，等待处理"
+        : "正在处理您的请求"
+      : event.type === "model"
+        ? "调用模型，整理您的需求"
+        : event.type === "saved"
+          ? "本轮沟通内容已保存"
+          : event.type === "node"
+            ? steps[event.node || ""] || "整理本次沟通信息"
+            : tools[event.tool || ""] || "使用业务工具处理本次请求";
   return event.ok === false ? `${text}：暂未完成` : text;
 }
 const events = computed(() =>
@@ -82,7 +87,9 @@ const calls = computed(
       ></span>
       <span>{{
         run.status === "running"
-          ? "正在思考"
+          ? events.length === 1 && events[0]?.type === "queue"
+            ? "等待处理"
+            : "正在思考"
           : run.status === "failed"
             ? "暂未完成"
             : events.some((event) => event.ok === false)

@@ -6,14 +6,14 @@ from fastapi import APIRouter, Depends, Request
 from backend.agents.review.graph import resume_review
 from backend.api.v1.auth import PrincipalDep
 from backend.db.review_store import ReviewStore
-from backend.dependencies import CacheDep, DatabaseDep
+from backend.dependencies import CacheDep, DatabaseDep, SettingsDep
 from backend.models.review import ApplyReview, StartReview
 
 router = APIRouter(prefix="/projects/{project_id}/items/{item_id}", tags=["document-review"])
 
 
-def review_store(database: DatabaseDep, cache: CacheDep):
-    return ReviewStore(database, cache)
+def review_store(database: DatabaseDep, cache: CacheDep, settings: SettingsDep):
+    return ReviewStore(database, cache, settings.queue)
 
 
 StoreDep = Annotated[ReviewStore, Depends(review_store)]
@@ -29,16 +29,11 @@ async def start_review(
     store: StoreDep,
 ):
     runtime = request.app.state.agent_runtime
-    runtime.reserve()
-    try:
-        result, created = await store.start(principal, project_id, item_id, data)
-    except BaseException:
-        runtime.release()
-        raise
-    if created:
-        runtime.launch_review(store, principal, project_id, item_id, UUID(result["id"]))
-    else:
-        runtime.release()
+    if not runtime.configured:
+        from backend.models.projects import ProjectError
+
+        raise ProjectError("AGENT_NOT_CONFIGURED", "文档检查暂时不可用，请联系负责人。", 503)
+    result, _ = await store.start(principal, project_id, item_id, data)
     return result
 
 

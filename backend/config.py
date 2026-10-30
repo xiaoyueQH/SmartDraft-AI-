@@ -124,6 +124,23 @@ class AgentSettings(BaseModel):
     draft_history_chars: int = Field(default=200000, ge=12000, le=500000)
 
 
+class QueueSettings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    capacity: int = Field(default=100, ge=1, le=10000)
+    per_user: int = Field(default=4, ge=1, le=100)
+    wait_seconds: int = Field(default=600, ge=30, le=3600)
+    poll_seconds: float = Field(default=0.5, ge=0.01, le=10)
+    lease_seconds: int = Field(default=30, ge=10, le=120)
+    heartbeat_seconds: float = Field(default=5, ge=0.1, le=30)
+    shutdown_seconds: float = Field(default=165, ge=1, le=300)
+
+    @model_validator(mode="after")
+    def heartbeat_before_expiry(self):
+        if self.heartbeat_seconds * 3 >= self.lease_seconds:
+            raise ValueError("任务心跳间隔必须小于租约期限的三分之一")
+        return self
+
+
 class RecoverySettings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     enabled: bool = True
@@ -163,6 +180,7 @@ class Settings(BaseSettings):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
     recovery: RecoverySettings = Field(default_factory=RecoverySettings)
+    queue: QueueSettings = Field(default_factory=QueueSettings)
 
 
 @lru_cache(maxsize=1)

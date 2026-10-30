@@ -31,6 +31,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.request_slots = asyncio.Semaphore(resolved_settings.app.request_capacity)
         passwords = PasswordWork(resolved_settings.auth.password_workers)
         agent = AgentRuntime(resolved_settings.agent, recovery=resolved_settings.recovery)
+        agent.queue_settings = resolved_settings.queue
         app.state.agent_runtime = agent
         guard = FlowGuard(database, cache, agent, resolved_settings.recovery)
         app.state.flow_guard = guard

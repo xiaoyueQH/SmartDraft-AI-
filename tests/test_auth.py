@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from backend.db.session import Database
 from backend.dependencies import get_database
 from backend.main import create_app
 from backend.models.orm import Base, LoginSession, User
+from backend.services.job_worker import JobWorker
 
 PASSWORD = "Test-password-2026"
 ORIGIN = "http://test"
@@ -47,10 +49,27 @@ async def auth_api(tmp_path):
         for name, role in (("alice", "user"), ("bob", "staff"), ("admin", "admin")):
             await service.create_user(name, name.title(), role, PASSWORD)
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport, base_url=ORIGIN, headers={"Origin": ORIGIN}
-        ) as client:
-            yield client, service, database
+        worker = JobWorker(
+            database,
+            None,
+            settings.model_copy(
+                update={
+                    "queue": settings.queue.model_copy(
+                        update={"poll_seconds": 0.01, "shutdown_seconds": 0.3}
+                    )
+                }
+            ),
+            runtime=app.state.agent_runtime,
+        )
+        consumer = asyncio.create_task(worker.run())
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url=ORIGIN, headers={"Origin": ORIGIN}
+            ) as client:
+                yield client, service, database
+        finally:
+            worker.stop()
+            await consumer
     await database.close()
 
 
