@@ -4,7 +4,7 @@ import logging
 from time import monotonic
 from uuid import UUID
 
-from backend.agents.common import tool_json
+from backend.agents.common import execution_task, route_agent, tool_json
 from backend.agents.consultation.graph import ConsultationWorkflow, run_fact_graph
 from backend.agents.project.graph import ProjectWorkflow
 from backend.agents.review.graph import run_review
@@ -14,6 +14,7 @@ from backend.core.llm.factory import ModelFactory
 from backend.core.llm.models import ModelError, ModelPurpose
 from backend.db.checkpoints import DatabaseCheckpointer
 from backend.db.conversation_store import ConversationStore
+from backend.models.handoff import AgentResult
 from backend.models.projects import ProjectError
 
 logger = logging.getLogger("supportflow.agent")
@@ -55,8 +56,17 @@ class AgentRuntime:
 
     async def execute_facts(self, store, principal, project_id, job):
         try:
+            task = execution_task(
+                principal,
+                job["project"],
+                UUID(job["run_id"]),
+                self.settings,
+                agent=route_agent(job["project"]["phase"], silent=True),
+                silent=True,
+            )
             async with asyncio.timeout(self.settings.run_seconds):
-                await run_fact_graph(self, store, principal, project_id, job)
+                saved_version = await run_fact_graph(self, store, principal, project_id, job, task)
+            return AgentResult.for_task(task, saved_project_version=saved_version)
         except asyncio.CancelledError:
             await store.fail_facts(project_id, UUID(job["run_id"]))
             raise
@@ -153,7 +163,7 @@ class AgentRuntime:
     async def execute_review(self, store, principal, project_id, item_id, review_id):
         try:
             async with asyncio.timeout(self.settings.review_run_seconds):
-                await run_review(self, store, principal, project_id, item_id, review_id)
+                return await run_review(self, store, principal, project_id, item_id, review_id)
         except asyncio.CancelledError:
             await store.fail_review(review_id, "服务正在停止，检查中断，原稿保持不变。")
             raise
@@ -210,20 +220,45 @@ class AgentRuntime:
                     snapshot["baseline"] = await store.item(
                         principal, project_id, UUID(snapshot["baseline"]["id"])
                     )
-                if snapshot["project"]["phase"] != "discovery":
+                current_run = next(row for row in snapshot["runs"] if row["id"] == str(run_id))
+                options = current_run.get("options") or {}
+                agent = route_agent(
+                    snapshot["project"]["phase"],
+                    mode=snapshot["project"].get("conversation_mode", "ai"),
+                    manual_document=options.get("intent") == "draft"
+                    and str(principal.account.id) == snapshot["project"]["owner_id"],
+                    accepted=current_run["status"] == "running"
+                    and current_run["actor_id"] == str(principal.account.id),
+                )
+                if agent != "consultation":
                     deadline.reschedule(
                         asyncio.get_running_loop().time() + self.settings.run_seconds
                     )
-                if snapshot["project"]["phase"] == "discovery":
+                task = execution_task(
+                    principal,
+                    snapshot["project"],
+                    run_id,
+                    self.settings,
+                    agent=agent,
+                    seconds=max(0.001, deadline.when() - asyncio.get_running_loop().time()),
+                    allow_search=bool(options.get("web_search")) and agent == "consultation",
+                )
+                if agent == "consultation":
                     workflow = ConsultationWorkflow(
                         self, store, principal, project_id, run_id, snapshot
                     )
                     workflow.execution_deadline = deadline.when()
+                    workflow.task = task
                     await workflow.run(prompt)
-                    return
-                await ProjectWorkflow(self, store, principal, project_id, run_id, snapshot).run(
-                    prompt
-                )
+                    return AgentResult.for_task(
+                        task,
+                        outcome=workflow.handoff_outcome,
+                        saved_project_version=workflow.saved_version,
+                    )
+                workflow = ProjectWorkflow(self, store, principal, project_id, run_id, snapshot)
+                workflow.task = task
+                saved_version = await workflow.run(prompt)
+                return AgentResult.for_task(task, saved_project_version=saved_version)
         except asyncio.CancelledError:
             await store.fail(run_id, "服务正在停止，本轮未提交草稿，请重新发送。")
             raise

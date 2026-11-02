@@ -4,11 +4,18 @@ import re
 import httpx
 from pydantic import ValidationError
 
-from backend.agents.drafting.prompts import SECTION
+from backend.agents.drafting.prompts import REVISION_SECTION, SECTION
 from backend.agents.tools.web_search import PUBLIC_TOPIC_TOOL, PUBLIC_TOPICS, search_public
 from backend.db.tool_store import ToolStore
 from backend.models.consultation import Reference
-from backend.models.drafting import DraftFinish, DraftPlan, DraftSection, WriteSection
+from backend.models.drafting import (
+    DraftFinish,
+    DraftPlan,
+    DraftSection,
+    ReadRevisionBlocks,
+    RevisionPlan,
+    WriteSection,
+)
 from backend.models.projects import ProjectError
 
 RECOVERABLE = (httpx.HTTPError, TimeoutError, ProjectError, ValueError)
@@ -52,6 +59,30 @@ class DraftTools:
 
     def schemas(self, web_enabled):
         empty = {"type": "object", "properties": {}, "additionalProperties": False}
+        if self.state.incremental:
+            choices = [
+                tool(
+                    "plan_revision",
+                    "规划直接修改、关联核对和受保护的原块ID",
+                    RevisionPlan.model_json_schema(),
+                ),
+                tool(
+                    "read_revision_blocks",
+                    "读取本次必需原文，每次最多4块，不截断",
+                    ReadRevisionBlocks.model_json_schema(),
+                ),
+                tool(
+                    "write_prd_section",
+                    "只更新已规划且已读取的原块，返回完整块",
+                    WriteSection.model_json_schema(),
+                ),
+                tool(
+                    "finish_draft",
+                    "结束本次局部更新，随后统一核对",
+                    DraftFinish.model_json_schema(),
+                ),
+            ]
+            return [*choices, PUBLIC_TOPIC_TOOL] if web_enabled else choices
         tools = [
             tool(
                 "plan_draft",
@@ -79,7 +110,42 @@ class DraftTools:
             args = json.loads(function["arguments"])
             if not isinstance(args, dict):
                 raise ValueError("Tool arguments must be an object")
-            if name == "plan_draft":
+            if self.state.incremental and name not in {
+                "plan_revision",
+                "read_revision_blocks",
+                "write_prd_section",
+                "finish_draft",
+                "web_search",
+            }:
+                raise ValueError("局部更新不提供全文替代工具")
+            if self.state.incremental and name == "plan_revision":
+                plan = RevisionPlan.model_validate(args)
+                known = {b["id"] for b in self.state.original_blocks}
+                if (
+                    self.state.section_specs
+                    or not set([*plan.targets, *plan.related, *plan.protected]) <= known
+                ):
+                    raise ValueError("范围无效或写作已开始")
+                if set(plan.targets) & set(self.state.fixed_protected):
+                    raise ValueError("目标包含客户禁止改动或原话块")
+                self.state.revision_plan = plan
+                result = {"ok": True, "targets": plan.targets, "related": plan.related}
+            elif self.state.incremental and name == "read_revision_blocks":
+                request = ReadRevisionBlocks.model_validate(args)
+                rows = {b["id"]: b for b in self.state.original_blocks}
+                if (
+                    not set(request.ids) <= set(rows)
+                    or sum(len(rows[s]["content"]) for s in request.ids) > 24000
+                ):
+                    raise ValueError("读取范围无效或过大")
+                self.state.read_ids = list(dict.fromkeys([*self.state.read_ids, *request.ids]))
+                result = {
+                    "ok": True,
+                    "blocks": [{"id": sid, "content": rows[sid]["content"]} for sid in request.ids],
+                }
+            elif self.state.incremental and name == "plan_draft":
+                raise ValueError("局部修订不能重规划整篇")
+            elif name == "plan_draft":
                 plan = DraftPlan.model_validate(args)
                 if self.state.original_blocks:
                     originals = {b["id"]: b for b in self.state.original_blocks}
@@ -115,7 +181,7 @@ class DraftTools:
                 }
             elif name == "finish_draft":
                 request = DraftFinish.model_validate(args)
-                if not self.state.sections:
+                if not self.state.sections and not self.state.revision_plan:
                     raise ValueError("No completed section; write or return full Markdown")
                 if request.assumptions:
                     self.state.assumptions = request.assumptions
@@ -183,6 +249,8 @@ class DraftTools:
         )
 
     async def write(self, request):
+        if self.state.incremental:
+            return await self.write_revision(request)
 
         spec = (
             next((s for s in self.state.plan.sections if s.id == request.section_id), None)
@@ -271,6 +339,50 @@ class DraftTools:
                 "code": error_code(error),
                 "message": "本章暂未生成，请继续其他章或结束；本轮不重试。",
             }
+
+    async def write_revision(self, request):
+        state, plan = self.state, self.state.revision_plan
+        if not plan or request.section_id not in plan.targets:
+            raise ValueError("请先规划本次修改范围")
+        if not set([*plan.targets, *plan.related]) <= set(state.read_ids):
+            raise ValueError("写前须读取目标和关联原文")
+        if request.section_id in state.section_specs:
+            return {"ok": False, "code": "SECTION_ALREADY_ATTEMPTED"}
+        original = next(b for b in state.original_blocks if b["id"] == request.section_id)
+        spec = DraftSection(
+            id=original["id"], title=original["title"][:80] or "文档说明", focus=request.focus
+        )
+        state.section_specs[spec.id] = spec
+        try:
+            await self.flow.event("draft_section", "正在更新相关说明")
+            response = await self.runtime.model(
+                REVISION_SECTION,
+                {
+                    **state.context(include_written=True),
+                    "current_section": spec.model_dump(),
+                    "original_section": original["content"],
+                    "related_originals": [
+                        {"id": b["id"], "content": b["content"]}
+                        for b in state.original_blocks
+                        if b["id"] in plan.related
+                    ],
+                },
+                output_limit=self.flow.agent.settings.draft_section_output_tokens,
+                purpose="draft_writer",
+                preview_title=spec.title,
+            )
+            body = response.get("content")
+            if not isinstance(body, str) or not body.strip() or len(body) > 24000:
+                raise ProjectError("REVISION_TEXT_INVALID", "本块修改未完整生成", 503)
+            if response.get("tool_calls") or body.lstrip().startswith(("{", "[")):
+                raise ProjectError("REVISION_TEXT_INVALID", "本块修改格式无效", 503)
+            state.sections[spec.id] = body
+            return {"ok": True, "section_id": spec.id, "excerpt": body[:200]}
+        except (ProjectError, httpx.HTTPError, TimeoutError, ValueError) as error:
+            if not recoverable(error):
+                raise
+            state.failures[spec.id] = error_code(error)
+            return {"ok": False, "section_id": spec.id, "code": error_code(error)}
 
     async def search(self, args, enabled):
         if set(args) != {"topic"} or not isinstance(args["topic"], str):

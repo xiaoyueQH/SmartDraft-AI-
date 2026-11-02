@@ -1,10 +1,12 @@
 import hashlib
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select
+from pydantic import ValidationError
+from sqlalchemy import and_, delete, func, or_, select
 
 from backend.config import QueueSettings
 from backend.db.identity import lock_identity
@@ -13,6 +15,22 @@ from backend.db.session import Database
 from backend.models.auth import Principal
 from backend.models.consultation import ConsultationState, FactEvidence
 from backend.models.discovery import merge_discovery
+from backend.models.documents import (
+    DocumentIndex,
+    DocumentMetadata,
+    DocumentUndo,
+    apply_inverse,
+    bounded_revision,
+    build_document_index,
+    content_hash,
+    restore_block_ids,
+    revision_block_ids,
+    revision_edits,
+    split_markdown,
+    unchanged_inverse_blocks,
+    validate_revision_markdown,
+)
+from backend.models.drafting import RevisionCommit
 from backend.models.jobs import AgentJob
 from backend.models.orm import User
 from backend.models.projects import (
@@ -29,8 +47,9 @@ from backend.models.projects import (
     ProjectRun,
     SendMessage,
     StartConsultation,
+    UndoDocument,
 )
-from backend.models.review import DocumentRevision, split_markdown
+from backend.models.review import DocumentReview, DocumentRevision
 
 
 def now():
@@ -605,6 +624,74 @@ class ProjectStore:
                 raise ProjectError("SOURCE_CHANGED", "来源内容已变化，不能据此确认原话", 409)
             return {"evidence": view(evidence), "content": content, "verified": True}
 
+    async def _document_index(self, session, row):
+        """Caller holds the project/item locks; derived data does not change business versions."""
+        if row.kind not in {"specification", "change"}:
+            return None
+        if row.version is None:
+            await session.flush()
+        metadata = await session.get(DocumentMetadata, row.id)
+        previous, untrusted = None, False
+        if metadata:
+            try:
+                previous = DocumentIndex.model_validate(metadata.manifest)
+                if previous.item_id != row.id or metadata.project_id != row.project_id:
+                    raise ValueError("目录归属不匹配")
+                if metadata.parser_version != previous.parser_version:
+                    raise ValueError("目录解析版本不匹配")
+                if (
+                    metadata.content_version != previous.content_version
+                    or metadata.content_hash != previous.content_hash
+                    or previous.content_version > row.version
+                ):
+                    raise ValueError("目录版本或校验信息不匹配")
+                if (
+                    metadata.content_version == previous.content_version == row.version
+                    and metadata.content_hash == previous.content_hash == content_hash(row.content)
+                ):
+                    if previous.status == "ready":
+                        previous.read_blocks(row.content)
+                        return previous
+                    # Re-evaluate an unavailable index instead of trusting a stale capacity flag.
+                    previous, untrusted = None, True
+            except (ValueError, ValidationError):
+                previous, untrusted = None, True
+        index = build_document_index(row.id, row.version, row.content, previous)
+        if untrusted:
+            index = DocumentIndex.model_validate(
+                index.model_dump() | {"mapping_status": "invalidated"}
+            )
+        if metadata is None:
+            metadata = DocumentMetadata(item_id=row.id, project_id=row.project_id)
+            session.add(metadata)
+        metadata.project_id = row.project_id
+        metadata.content_version, metadata.content_hash = index.content_version, index.content_hash
+        metadata.parser_version, metadata.manifest = (
+            index.parser_version,
+            index.model_dump(mode="json"),
+        )
+        return index
+
+    async def document_index(self, principal, project_id, item_id, expected_version=None):
+        # The lazy write updates a rebuildable sidecar only; no signatures, audit or body change.
+        async with self._write_session() as session:
+            await self._project(session, principal, project_id, write=True)
+            row = await session.scalar(
+                select(ProjectItem)
+                .where(
+                    ProjectItem.id == item_id,
+                    ProjectItem.project_id == project_id,
+                    ProjectItem.kind.in_(["specification", "change"]),
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ProjectError("ITEM_NOT_FOUND", "需求文档不存在", 404)
+            if expected_version is not None and row.version != expected_version:
+                raise ProjectError("VERSION_CONFLICT", "正文已更新，请读取最新目录", 409)
+            index = await self._document_index(session, row)
+            return index.model_dump(mode="json")
+
     async def item(self, principal, project_id, item_id):
         async with self.database.session() as session:
             await self._project(session, principal, project_id)
@@ -616,6 +703,219 @@ class ProjectStore:
             if not row:
                 raise ProjectError("ITEM_NOT_FOUND", "资料不存在", 404)
             return view(row)
+
+    async def latest_document_change(self, principal, project_id, item_id):
+        async with self.database.session() as session:
+            await self._project(session, principal, project_id)
+            row = await session.scalar(
+                select(ProjectItem).where(
+                    ProjectItem.id == item_id,
+                    ProjectItem.project_id == project_id,
+                    ProjectItem.kind.in_(["specification", "change"]),
+                )
+            )
+            if row is None:
+                raise ProjectError("ITEM_NOT_FOUND", "需求文档不存在", 404)
+            change = await session.get(DocumentUndo, item_id)
+            if not change or change.project_id != project_id:
+                return {"change": None, "can_undo": False}
+            return {
+                "change": {
+                    "id": str(change.id),
+                    "before_version": change.before_version,
+                    "after_version": change.after_version,
+                    "edits": change.edits,
+                },
+                "can_undo": row.published_revision is None
+                and (
+                    row.status in {"draft", "submitted"}
+                    or row.kind == "specification"
+                    and row.status in {"rejected", "withdrawn"}
+                )
+                and row.version >= change.after_version
+                and content_hash(row.content) == change.after_hash
+                and row.questions == change.after_questions,
+                "current_version": row.version,
+            }
+
+    async def _clear_document_change(self, session, item_id):
+        await session.execute(delete(DocumentUndo).where(DocumentUndo.item_id == item_id))
+
+    async def _commit_incremental(self, session, row, data, replacement, run):
+        try:
+            change = RevisionCommit.model_validate(replacement)
+            if (
+                change.id != str(row.id)
+                or change.version != row.version
+                or change.hash != content_hash(row.content)
+                or data.title != row.title
+            ):
+                raise ValueError("原文校验失败")
+            index = await self._document_index(session, row)
+            blocks = index.read_blocks(row.content)
+            known = {b["id"] for b in blocks}
+            if (
+                set(change.replacements) != set(change.target_ids)
+                or not set(
+                    [
+                        *change.target_ids,
+                        *change.related_ids,
+                        *change.protected_ids,
+                        *change.read_ids,
+                    ]
+                )
+                <= known
+                or not set([*change.target_ids, *change.related_ids]) <= set(change.read_ids)
+                or set(change.target_ids) & set(change.protected_ids)
+                or any(
+                    b["id"] in change.target_ids
+                    and re.search(r"客户原话|用户原始要求|原始需求原文", b["title"])
+                    for b in blocks
+                )
+            ):
+                raise ValueError("修改范围或关联读取不匹配")
+            candidate = "".join(change.replacements.get(b["id"], b["content"]) for b in blocks)
+            for block in blocks:
+                if (
+                    block["id"] in change.replacements
+                    and change.replacements[block["id"]] != block["content"]
+                ):
+                    validate_revision_markdown(change.replacements[block["id"]])
+            if candidate != data.content or data.questions != row.questions:
+                raise ValueError("修改包含范围外内容或问题变更")
+            edits = revision_edits(blocks, change.replacements)
+            if not edits:
+                return False
+            old_blocks = [b.model_dump() for b in index.blocks if b.id in change.target_ids]
+            bounded_revision(
+                edits,
+                row.content,
+                {
+                    "before_questions": row.questions,
+                    "after_questions": data.questions,
+                    "before_blocks": old_blocks,
+                },
+            )
+        except ValueError as error:
+            raise ProjectError("REVISION_INVALID", str(error), 409) from error
+        await self._clear_document_change(session, row.id)
+        record = DocumentUndo(
+            item_id=row.id,
+            project_id=row.project_id,
+            run_id=run.id,
+            id=uuid4(),
+            before_version=row.version,
+            after_version=row.version + 1,
+            before_hash=content_hash(row.content),
+            after_hash=content_hash(data.content),
+            edits=edits,
+            before_questions=list(row.questions),
+            after_questions=list(data.questions),
+            before_blocks=old_blocks,
+        )
+        session.add(record)
+        row.content, row.questions = data.content, data.questions
+        row.version += 1
+        row.status, row.customer_confirmed, row.staff_confirmed = "draft", False, False
+        row.resolution = row.acceptance_note = ""
+        updated_index = await self._document_index(session, row)
+        try:
+            updated_index = revision_block_ids(updated_index, blocks, change.replacements)
+        except ValueError as error:
+            raise ProjectError("REVISION_INVALID", "修改破坏了原有结构，原稿保留", 409) from error
+        (await session.get(DocumentMetadata, row.id)).manifest = updated_index.model_dump(
+            mode="json"
+        )
+        return True
+
+    async def undo_document_change(self, principal, project_id, item_id, data: UndoDocument):
+        digest = fingerprint(f"undo_document:{project_id}:{item_id}", data.model_dump())
+        async with self._write_session() as session:
+            project, actor = await self._project(session, principal, project_id, write=True)
+            replay = await self._replay(session, principal, data.request_id, digest)
+            if replay:
+                return replay
+            busy = await session.scalar(
+                select(AgentJob.id)
+                .where(
+                    AgentJob.project_id == project_id, AgentJob.status.in_(["queued", "running"])
+                )
+                .limit(1)
+            )
+            busy = busy or await session.scalar(
+                select(ProjectRun.id)
+                .where(ProjectRun.project_id == project_id, ProjectRun.status == "running")
+                .limit(1)
+            )
+            busy = busy or await session.scalar(
+                select(DocumentReview.id)
+                .where(DocumentReview.project_id == project_id, DocumentReview.status == "running")
+                .limit(1)
+            )
+            if busy:
+                raise ProjectError("PROJECT_BUSY", "本项目仍在处理，请完成后再撤销", 409)
+            row = await session.scalar(
+                select(ProjectItem)
+                .where(
+                    ProjectItem.id == item_id,
+                    ProjectItem.project_id == project_id,
+                    ProjectItem.kind.in_(["specification", "change"]),
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ProjectError("ITEM_NOT_FOUND", "需求文档不存在", 404)
+            change = await session.get(DocumentUndo, item_id)
+            if (
+                row.version != data.expected_version
+                or row.published_revision is not None
+                or not (
+                    row.status in {"draft", "submitted"}
+                    or row.kind == "specification"
+                    and row.status in {"rejected", "withdrawn"}
+                )
+                or not change
+                or change.id != data.change_id
+                or change.project_id != project_id
+                or content_hash(row.content) != change.after_hash
+                or row.questions != change.after_questions
+            ):
+                raise ProjectError(
+                    "VERSION_CONFLICT", "正文或最近修改已变化，不能覆盖，请重新读取", 409
+                )
+            try:
+                current_index = await self._document_index(session, row)
+                unchanged = unchanged_inverse_blocks(current_index.blocks, change.edits)
+                restored = apply_inverse(row.content, change.edits)
+                if content_hash(restored) != change.before_hash:
+                    raise ValueError("恢复校验失败")
+            except ValueError as error:
+                raise ProjectError("UNDO_INVALID", "最近差异无法安全恢复，原稿保留", 409) from error
+            row.content, row.questions = restored, change.before_questions
+            row.version += 1
+            row.status, row.customer_confirmed, row.staff_confirmed = "draft", False, False
+            row.resolution = row.acceptance_note = ""
+            index = await self._document_index(session, row)
+            try:
+                index = restore_block_ids(index, [*unchanged, *change.before_blocks])
+            except ValueError as error:
+                raise ProjectError("UNDO_INVALID", "最近目录无法安全恢复，原稿保留", 409) from error
+            (await session.get(DocumentMetadata, item_id)).manifest = index.model_dump(mode="json")
+            state = ConsultationState.model_validate(project.consultation or {})
+            state.document_pending = True
+            project.consultation = state.model_dump(mode="json")
+            project.version += 1
+            await session.delete(change)
+            await session.flush()
+            return self._record(
+                session,
+                principal,
+                project_id,
+                data.request_id,
+                digest,
+                f"undo_document:{item_id}",
+                {"item": view(row)},
+            )
 
     async def items(self, principal, project_id, offset, limit, *, summaries=False):
         async with self.database.session() as session:
@@ -733,6 +1033,7 @@ class ProjectStore:
             session.add(row)
             project.version += 1
             await session.flush()
+            await self._document_index(session, row)
             return self._record(
                 session, principal, project_id, data.request_id, digest, "create_item", view(row)
             )
@@ -783,7 +1084,10 @@ class ProjectStore:
                 if not data.title or not data.content:
                     raise ProjectError("CONTENT_REQUIRED", "请填写标题和正文", 422)
                 if document:
-                    await remember_revision(session, row, actor.id, "before_edit")
+                    await self._clear_document_change(session, row.id)
+                    index = await self._document_index(session, row)
+                    blocks = index.read_blocks(row.content) if index.status == "ready" else None
+                    await remember_revision(session, row, actor.id, "before_edit", blocks)
                 row.title, row.content, row.questions = data.title, data.content, data.questions
                 row.status, row.customer_confirmed, row.staff_confirmed = "draft", False, False
                 row.resolution = row.acceptance_note = ""
@@ -808,6 +1112,7 @@ class ProjectStore:
                 else:
                     raise ProjectError("FORBIDDEN", "需要客户或负责人确认", 403)
                 if row.staff_confirmed and row.customer_confirmed:
+                    await self._clear_document_change(session, row.id)
                     project.revision += 1
                     row.published_revision, row.status = project.revision, "approved"
                     if project.phase == "discovery":
@@ -851,6 +1156,7 @@ class ProjectStore:
             row.workflow_reminded_at = None
             project.version += 1
             await session.flush()
+            await self._document_index(session, row)
             return self._record(
                 session,
                 principal,
@@ -1055,8 +1361,8 @@ class ProjectStore:
                 run.cache_version += 1
 
     async def draft_target(self, principal, project_id, expected_version):
-        async with self.database.session() as session:
-            project, _ = await self._project(session, principal, project_id)
+        async with self._write_session() as session:
+            project, _ = await self._project(session, principal, project_id, write=True)
             if project.version != expected_version:
                 raise ProjectError("VERSION_CONFLICT", "草案资料已变化，请刷新后继续")
             item = await session.scalar(
@@ -1069,7 +1375,14 @@ class ProjectStore:
                 .order_by(ProjectItem.created_at.desc(), ProjectItem.id.desc())
                 .limit(1)
             )
-            return view(item) if item else None
+            if item is None:
+                return None
+            index = await self._document_index(session, item)
+            if index.status != "ready":
+                raise ProjectError(
+                    "DOCUMENT_INDEX_LIMIT", "文档结构较多，请分阶段整理；原稿保留", 503
+                )
+            return {**view(item), "blocks": index.read_blocks(item.content)}
 
     async def finish(
         self,
@@ -1176,6 +1489,8 @@ class ProjectStore:
                         .with_for_update()
                     )
                 if current is not None:
+                    await self._clear_document_change(session, current.id)
+                    await self._document_index(session, current)
                     current.title, current.content, current.questions = (
                         data.title,
                         data.content,
@@ -1194,6 +1509,7 @@ class ProjectStore:
                         f"agent_regenerate:{current.id}",
                         {"note": "已更新最新需求草案。"},
                     )
+                    await self._document_index(session, current)
                     continue
                 if replacement:
                     if len(drafts) != 1 or data.kind != "specification":
@@ -1213,6 +1529,23 @@ class ProjectStore:
                         or original.version != replacement["version"]
                     ):
                         raise ProjectError("VERSION_CONFLICT", "原草稿已变化，补写结果未覆盖正文")
+                    if replacement.get("incremental"):
+                        changed = await self._commit_incremental(
+                            session, original, data, replacement, run
+                        )
+                        if changed:
+                            self._record(
+                                session,
+                                principal,
+                                project_id,
+                                run.request_id,
+                                fingerprint("agent_revision", {"run": str(run_id)}),
+                                f"agent_revision:{original.id}",
+                                {"note": "已更新相关内容，其他正文保留。"},
+                            )
+                        continue
+                    await self._clear_document_change(session, original.id)
+                    await self._document_index(session, original)
                     original.content, original.questions = data.content, data.questions
                     original.version += 1
                     original.status = "draft"
@@ -1227,6 +1560,7 @@ class ProjectStore:
                         f"agent_revision:{original.id}",
                         {"note": "已补写最新需求草案的指定章节。"},
                     )
+                    await self._document_index(session, original)
                     continue
                 if data.kind in {"task", "acceptance"} and actor.role != "admin":
                     raise ProjectError(
@@ -1234,16 +1568,16 @@ class ProjectStore:
                     )
                 if data.kind != "specification" and not project.revision:
                     raise ProjectError("BASELINE_REQUIRED", "请先确认初版需求书，再处理变更与售后")
-                session.add(
-                    ProjectItem(
-                        id=uuid4(),
-                        project_id=project_id,
-                        created_by=actor.id,
-                        created_at=now(),
-                        base_revision=revision,
-                        **data.model_dump(),
-                    )
+                row = ProjectItem(
+                    id=uuid4(),
+                    project_id=project_id,
+                    created_by=actor.id,
+                    created_at=now(),
+                    base_revision=revision,
+                    **data.model_dump(),
                 )
+                session.add(row)
+                await self._document_index(session, row)
             if continue_discussion:
                 assistant = await session.scalar(
                     select(ProjectMessage).where(

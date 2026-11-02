@@ -1,12 +1,13 @@
 import hashlib
 import re
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
 from backend.agents.common import supported_technical_fact, technology_has_source
 from backend.models.consultation import ConsultationState, Extraction
 from backend.models.drafting import DraftDecision
+from backend.models.handoff import DocumentAction
 from backend.models.projects import DiscoveryNotes
 
 
@@ -18,6 +19,7 @@ class GraphState(TypedDict):
 class FactState(TypedDict):
     patch: dict
     sources: list[dict]
+    saved_version: int
 
 
 class ConsultationPayload(BaseModel):
@@ -31,6 +33,8 @@ class ConsultationPayload(BaseModel):
     patches: list[dict] = Field(default_factory=list)
     drafts: list[dict] = Field(default_factory=list)
     replacement: dict | None = None
+    document_action: DocumentAction | None = None
+    handoff_outcome: Literal["completed", "partial", "no_change"] = "completed"
     rounds: int = Field(default=0, ge=0)
     tokens: int = Field(default=0, ge=0)
     calls: int = Field(default=0, ge=0)
@@ -59,7 +63,9 @@ def valid_draft_request(quote, prompt):
         for clause in re.split(r"[，,。；;！!？?\n]", text):
             clause = clause.strip()
             if result and re.fullmatch(
-                r"(?:等等|算了|不用了|先别|先不要|暂时不用|取消)(?:吧|了|先继续聊)?", clause
+                r"(?:等等|算了|不用了|先别|先不要|暂时不用|取消){1,3}"
+                r"(?:吧|了|先继续聊)?",
+                clause,
             ):
                 result = False
                 continue
@@ -90,7 +96,7 @@ def valid_draft_request(quote, prompt):
                 bare
                 or not before
                 or re.search(
-                    r"请|麻烦|帮我|给我|直接|现在|先|重新|开始|把|将|能不能|能否|可以", before
+                    r"请|麻烦|帮我|给我|直接|现在|先|重新|开始|把|将|能不能|能否|可以|只|仅", before
                 )
             ):
                 result = True
@@ -98,6 +104,25 @@ def valid_draft_request(quote, prompt):
 
     # Check the full turn as well: a clipped quote cannot bypass negation or a later cancellation.
     return directive(quote) and directive(prompt)
+
+
+def document_action(prompt, *, has_draft=False):
+    """Classify only after current-turn authorization; this function grants no permission."""
+    clauses = [
+        clause
+        for clause in re.split(r"[，,。；;！!？?\n]", prompt)
+        if valid_draft_request(clause, clause)
+    ]
+    directive = clauses[-1] if clauses else prompt
+    if re.search(r"补齐|补全|补写", directive):
+        return "fill"
+    if re.search(r"修改|更新|完善", directive) and not re.search(
+        r"整篇|整份|全文|全部|完全重写", directive
+    ):
+        return "revise"
+    if re.search(r"重新生成|重写|整篇|整份|全文|全部", directive):
+        return "rewrite_all" if has_draft else "create"
+    return "revise" if has_draft else "create"
 
 
 def source_catalog(prompt, run_id, history=()):

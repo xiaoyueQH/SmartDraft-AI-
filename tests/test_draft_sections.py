@@ -299,18 +299,19 @@ async def test_unknown_tool_or_bad_arguments_return_safe_feedback():
     )
 
 
-async def test_deadline_preserves_completed_chapter_and_commit_reserve():
+async def test_deadline_preserves_completed_chapter_and_commit_reserve(monkeypatch):
     flow = AgentFlow([tools(call("write_prd_section", SPECS[0]))])
     started = asyncio.get_running_loop().time()
-    flow.execution_deadline = started + 13.1
-    original = flow.model
+    flow.execution_deadline = started + 20
+    original = DraftNodes.model
 
-    async def model(system, data, **kwargs):
+    async def model(self, system, data, **kwargs):
         if flow.rounds == 2:
-            await asyncio.sleep(5)
-        return await original(system, data, **kwargs)
+            # Expire before the next call, independent of machine/checkpoint scheduling speed.
+            self.deadline = asyncio.get_running_loop().time() + 0.02
+        return await original(self, system, data, **kwargs)
 
-    flow.model = model
+    monkeypatch.setattr(DraftNodes, "model", model)
     result = await create_draft(flow, checkpointer=InMemorySaver())
     assert result["partial"] and asyncio.get_running_loop().time() - started < 2
     assert "店主确认收款后扣库存" in result["document"]["content"]

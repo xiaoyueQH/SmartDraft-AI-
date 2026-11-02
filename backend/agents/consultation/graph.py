@@ -1,20 +1,38 @@
+from uuid import UUID
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from backend.agents.common import execution_task
 from backend.agents.consultation.nodes import ConsultationNodes, FactNodes
 from backend.agents.consultation.state import FactState, GraphState
 from backend.db.checkpoints import DatabaseCheckpointer
 
 
-async def run_fact_graph(agent, store, principal, project_id, job):
+async def run_fact_graph(agent, store, principal, project_id, job, task=None):
+    task = task or execution_task(
+        principal,
+        job["project"],
+        UUID(job["run_id"]),
+        agent.settings,
+        agent="consultation",
+        silent=True,
+    )
+    task.validate_scope(principal, project_id, UUID(job["run_id"]))
+    if task.action != "record":
+        raise ValueError("人工整理只能接收静默记录任务")
     nodes = FactNodes(agent, store, principal, project_id, job)
+    nodes.task = task
     graph = StateGraph(FactState)
     graph.add_node("extract_facts", nodes.extract_facts)
     graph.add_node("persist_facts", nodes.persist_facts)
     graph.add_edge(START, "extract_facts")
     graph.add_edge("extract_facts", "persist_facts")
     graph.add_edge("persist_facts", END)
-    await graph.compile().ainvoke({"patch": {}, "sources": []}, config={"recursion_limit": 5})
+    result = await graph.compile().ainvoke(
+        {"patch": {}, "sources": []}, config={"recursion_limit": 5}
+    )
+    return result["saved_version"]
 
 
 def build_graph(nodes, saver):
@@ -46,6 +64,7 @@ def build_graph(nodes, saver):
 
 class ConsultationWorkflow(ConsultationNodes):
     async def run(self, prompt):
+        self.task.validate_scope(self.principal, self.project_id, self.run_id)
         self.prompt = prompt
         run = next(item for item in self.snapshot["runs"] if item["id"] == str(self.run_id))
         self.options = run.get("options") or {}

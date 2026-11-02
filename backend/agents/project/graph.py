@@ -18,6 +18,9 @@ def build_graph(nodes):
 
 class ProjectWorkflow(ProjectNodes):
     async def run(self, prompt):
+        self.task.validate_scope(self.principal, self.project_id, self.run_id)
+        if self.task.agent != "project" or self.task.action != "chat":
+            raise ValueError("项目协作任务类型不匹配")
         context = {
             "project": self.snapshot["project"],
             "baseline": self.snapshot["baseline"],
@@ -52,7 +55,7 @@ class ProjectWorkflow(ProjectNodes):
         answer = result["answer"].strip()
         if not answer or len(answer) > 24000:
             raise ValueError("无效答复")
-        await self.store.finish(
+        return await self.store.finish(
             self.principal,
             self.project_id,
             self.run_id,

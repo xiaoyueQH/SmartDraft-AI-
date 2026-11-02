@@ -9,7 +9,6 @@ from langgraph.types import interrupt
 from pydantic import ValidationError
 
 from backend.agents.common import (
-    draft_revision_requested,
     measured_tokens,
     request_budget,
     tool_json,
@@ -17,6 +16,7 @@ from backend.agents.common import (
 from backend.agents.consultation.prompts import ADVISE, REPLY
 from backend.agents.consultation.state import (
     ConsultationPayload,
+    document_action,
     limit_questions,
     source_catalog,
     valid_draft_request,
@@ -34,6 +34,7 @@ from backend.models.consultation import (
 )
 from backend.models.discovery import merge_discovery
 from backend.models.drafting import DraftDecision
+from backend.models.handoff import AgentResult
 from backend.models.projects import ProjectError
 
 logger = logging.getLogger("supportflow.consultation")
@@ -63,6 +64,10 @@ class ConsultationNodes:
         self.discussion_saved = False
         self.expected_version = snapshot["project"]["version"]
         self.replacement = None
+        self.document_action = None
+        self.task = None
+        self.handoff_outcome = "completed"
+        self.saved_version = None
 
     async def event(self, node, summary, **extra):
         await self.store.event(
@@ -97,6 +102,7 @@ class ConsultationNodes:
         purpose="consultation",
         preview_title="",
         tool_choice=None,
+        inherited_budget=None,
     ):
         drafting = getattr(self, "in_drafting", False)
         max_rounds = (
@@ -105,8 +111,23 @@ class ConsultationNodes:
         budget = (
             self.agent.settings.draft_token_budget if drafting else self.agent.settings.token_budget
         )
+        if self.task:
+            max_rounds = min(max_rounds, self.task.budget.model_calls)
+            budget = min(budget, self.task.budget.tokens)
+        if inherited_budget is not None:
+            max_rounds = min(max_rounds, self.rounds + inherited_budget["model_calls"])
+            budget = min(budget, self.tokens + inherited_budget["tokens"])
         if self.rounds >= max_rounds:
             raise ProjectError("MODEL_BUDGET", "本轮处理达到次数上限，请分步继续", 503)
+        timeout_seconds = (
+            self.agent.settings.draft_model_timeout_seconds
+            if drafting
+            else max(self.agent.settings.timeout_seconds, 45)
+        )
+        if self.task:
+            timeout_seconds = min(timeout_seconds, self.task.budget.seconds())
+        if timeout_seconds <= 0:
+            raise ProjectError("TIME_BUDGET", "本次处理时间已用完，已有资料保留", 503)
         if schema:
             system += "\n输出JSON Schema：" + tool_json(schema.model_json_schema())
         messages = [
@@ -152,9 +173,7 @@ class ConsultationNodes:
                 json_output=bool(schema),
                 purpose=purpose,
                 on_text=on_text,
-                timeout_seconds=self.agent.settings.draft_model_timeout_seconds
-                if drafting
-                else max(self.agent.settings.timeout_seconds, 45),
+                timeout_seconds=timeout_seconds,
             )
         except (ProjectError, httpx.HTTPError, TimeoutError) as error:
             await self.store.event(
@@ -172,9 +191,12 @@ class ConsultationNodes:
         self.rounds += max(0, usage.get("attempts", 1) - 1)
         if count_native_tools:
             self.calls += len(message.get("tool_calls") or [])
-        if self.calls > (
+        max_tools = (
             self.agent.settings.draft_max_tools if drafting else self.agent.settings.max_tools
-        ):
+        )
+        if self.task:
+            max_tools = min(max_tools, self.task.budget.tool_calls)
+        if self.calls > max_tools:
             raise ProjectError("TOOL_BUDGET", "本轮工具调用达到上限，请分步处理", 503)
         used = measured_tokens(usage, reserve + allowance)
         self.tokens += used
@@ -197,14 +219,7 @@ class ConsultationNodes:
 
     async def extract(self, flow):
         self.decision = DraftDecision()
-        if (
-            self.options.get("intent") == "draft"
-            or is_draft_command(self.prompt)
-            or (
-                draft_revision_requested(self.prompt)
-                and valid_draft_request(self.prompt, self.prompt)
-            )
-        ):
+        if self.options.get("intent") == "draft" or is_draft_command(self.prompt):
             if str(self.principal.account.id) != self.snapshot["project"]["owner_id"]:
                 raise ProjectError("FORBIDDEN", "请由客户决定是否整理需求草案", 403)
             self.extraction = Extraction(
@@ -475,6 +490,10 @@ class ConsultationNodes:
                     item.status = "accepted"
                 elif item.id in rejected:
                     item.status = "rejected"
+        if self.notes != self.snapshot["project"]["discovery"] and any(
+            row["kind"] == "specification" for row in self.snapshot["items"]
+        ):
+            self.state.document_pending = True
         return {}
 
     async def decide_draft(self, flow):
@@ -484,12 +503,28 @@ class ConsultationNodes:
         requested = bool(
             self.options.get("intent") == "draft"
             or is_draft_command(self.prompt)
+            or valid_draft_request(self.prompt, self.prompt)
             or valid_draft_request(self.extraction.draft_request_quote, self.prompt)
             or valid_draft_request(self.decision.request_quote, self.prompt)
         )
         if requested and str(self.principal.account.id) != self.snapshot["project"]["owner_id"]:
             raise ProjectError("FORBIDDEN", "请由客户决定是否整理需求草案", 403)
         generate = requested and not self.state.draft_paused
+        if (
+            requested
+            and valid_draft_request(self.prompt, self.prompt)
+            and not (self.extraction.cancel_draft_quote or self.decision.pause_quote)
+        ):
+            self.state.draft_paused = False
+            generate = True
+        self.document_action = (
+            document_action(
+                self.prompt,
+                has_draft=any(row["kind"] == "specification" for row in self.snapshot["items"]),
+            )
+            if generate
+            else None
+        )
         if not generate and self.state.status != "draft_ready":
             self.state.status = "waiting_user"
         self.state.draft_consent = False
@@ -497,6 +532,8 @@ class ConsultationNodes:
         return {"route": "save_discussion" if generate else "wait_user"}
 
     async def save_discussion(self, flow):
+        if any(row["kind"] == "specification" for row in self.snapshot["items"]):
+            self.state.document_pending = True
         self.state.discussion_run_id = str(self.run_id)
         self.state.checkpoint_thread = self.thread
         self.answer = self.extraction.reply + "\n\n我会把这些信息整理成草案，供您继续核对。"
@@ -521,7 +558,12 @@ class ConsultationNodes:
     async def draft_agent(self, flow):
         try:
             result = await generate_prd(self)
+            AgentResult.model_validate(result["handoff"]).validate_for(
+                self.document_task, content=result["document"]["content"]
+            )
+            self.handoff_outcome = "partial" if result["partial"] else "completed"
         except (ProjectError, httpx.HTTPError, TimeoutError, ValueError) as error:
+            self.handoff_outcome = "partial"
             if isinstance(error, ProjectError) and error.code == "BUSINESS_CONTEXT_REQUIRED":
                 self.state.status = "waiting_user"
                 self.answer = error.message
@@ -538,6 +580,13 @@ class ConsultationNodes:
             )
             return {}
         self.drafts = [result["document"]]
+        self.state.document_pending = False
+        if result.get("no_change"):
+            self.drafts, self.replacement = [], None
+            self.handoff_outcome = "no_change"
+            self.state.status = "draft_ready"
+            self.answer = "当前需求已经包含这次要求，无需修改；原文和确认状态保持不变。"
+            return {}
         self.replacement = result.get("replacement")
         self.state.status, self.state.draft_consent = "draft_ready", False
         self.answer = (
@@ -549,7 +598,11 @@ class ConsultationNodes:
             )
         ) + "您可以在“需求草案”中查看、修改；目前尚未立项或发布。"
         if self.replacement:
-            self.answer = "已在当前草案中补写指定章节，其他章节保留；请查看最新草案。"
+            self.answer = (
+                "已更新需求书中的相关内容，其他正文保留；可查看修改差异，或撤销本次修改。"
+                if self.replacement.get("incremental")
+                else "已在当前草案中补写指定章节，其他章节保留；请查看最新草案。"
+            )
         return {}
 
     async def wait_user(self, flow):
@@ -561,7 +614,7 @@ class ConsultationNodes:
         await self.event("hitl", "沟通已保存，等待您补充或查看草案")
         self.state.last_run_id = str(self.run_id)
         self.state.checkpoint_thread = self.thread
-        await self.store.finish(
+        self.saved_version = await self.store.finish(
             self.principal,
             self.project_id,
             self.run_id,
@@ -598,7 +651,9 @@ class ConsultationNodes:
         self.answer = ""
         self.discussion_saved = False
         self.replacement = None
+        self.document_action = None
         self.notes = self.snapshot["project"]["discovery"]
+        self.handoff_outcome = "completed"
         self.state = ConsultationState.model_validate(
             self.snapshot["project"].get("consultation") or {}
         )
@@ -616,6 +671,8 @@ class ConsultationNodes:
                 "patches": self.patches,
                 "drafts": self.drafts,
                 "replacement": self.replacement,
+                "document_action": self.document_action,
+                "handoff_outcome": self.handoff_outcome,
                 "rounds": self.rounds,
                 "tokens": self.tokens,
                 "calls": self.calls,
@@ -651,6 +708,8 @@ class ConsultationNodes:
         self.decision = DraftDecision.model_validate(payload.get("decision") or {})
         self.record_retried = payload.get("record_retried", False)
         self.replacement = payload.get("replacement")
+        self.document_action = payload.get("document_action")
+        self.handoff_outcome = payload.get("handoff_outcome", "completed")
         self.discussion_saved = payload.get("discussion_saved", False)
         self.expected_version = payload.get("expected_version", self.snapshot["project"]["version"])
         self.run_id = UUID(payload["run_id"])
@@ -669,6 +728,7 @@ class ConsultationNodes:
                 self.extraction, self.replacement = None, None
                 self.answer = ""
                 self.decision = DraftDecision()
+                self.document_action = None
             return {**result, "payload": self.checkpoint_payload()}
 
         return invoke
@@ -774,11 +834,11 @@ class FactNodes(ConsultationNodes):
     async def persist_facts(self, state):
         from backend.models.consultation import FactSource
 
-        await self.store.finish_facts(
+        saved_version = await self.store.finish_facts(
             self.principal,
             self.project_id,
             self.job,
             state["patch"],
             [FactSource.model_validate(s) for s in state["sources"]],
         )
-        return {"patch": {}, "sources": []}
+        return {"patch": {}, "sources": [], "saved_version": saved_version}

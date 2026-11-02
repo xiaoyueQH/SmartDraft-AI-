@@ -1022,6 +1022,7 @@ class ConversationStore(ProjectStore):
                 raise ProjectError(
                     "VERSION_CONFLICT", "业务信息已变化，将根据最新内容重新整理", 409
                 )
+            previous_notes = project.discovery
             project.discovery = merge_discovery(project.discovery, patch)
             if project.phase == "discovery":
                 if "subject" in patch and not await self._has_custom_title(session, project.id):
@@ -1032,6 +1033,16 @@ class ConversationStore(ProjectStore):
                 ):
                     project.stack = project.discovery["technology_preference"]
             state = ConsultationState.model_validate(project.consultation or {})
+            if project.discovery != previous_notes and await session.scalar(
+                select(ProjectItem.id)
+                .where(
+                    ProjectItem.project_id == project_id,
+                    ProjectItem.kind == "specification",
+                    ProjectItem.published_revision.is_(None),
+                )
+                .limit(1)
+            ):
+                state.document_pending = True
             removed = patch.get("remove_facts", {})
             state.sources = [
                 s for s in [*state.sources, *sources] if s.value not in removed.get(s.field, [])
@@ -1067,6 +1078,7 @@ class ConversationStore(ProjectStore):
             project.version += 1
             run.status, run.answer = "completed", "客户信息已在后台整理。"
             run.cache_version += 1
+        return project.version
 
     async def fail_facts(self, project_id, run_id):
         async with self.database.session() as session:

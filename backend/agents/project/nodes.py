@@ -13,13 +13,13 @@ class ProjectNodes:
         self.toolset = ProjectTools(store, principal, project_id)
 
     async def decide(self, state):
-        if state["rounds"] >= self.runtime.settings.max_rounds:
+        budget = self.task.budget
+        max_rounds = min(self.runtime.settings.max_rounds, budget.model_calls)
+        max_tools = min(self.runtime.settings.max_tools, budget.tool_calls)
+        if state["rounds"] >= max_rounds or budget.seconds() <= 0:
             raise ProjectError("MODEL_BUDGET", "本轮调用次数已到上限，已保存内容保留", 503)
-        allow_tools = (
-            state["rounds"] < self.runtime.settings.max_rounds - 1
-            and state["calls"] < self.runtime.settings.max_tools
-        )
-        remaining = self.runtime.settings.token_budget - state["tokens"]
+        allow_tools = state["rounds"] < max_rounds - 1 and state["calls"] < max_tools
+        remaining = min(self.runtime.settings.token_budget, budget.tokens) - state["tokens"]
         input_reserve, allowance = request_budget(
             state["messages"], allow_tools, remaining, tools=TOOLS
         )
@@ -31,17 +31,16 @@ class ProjectNodes:
             max_output_tokens=allowance,
             tools=TOOLS,
             on_text=on_text,
-            max_attempts=min(
-                2, self.runtime.settings.max_rounds - state["rounds"] - int(allow_tools)
-            ),
+            timeout_seconds=min(self.runtime.settings.timeout_seconds, budget.seconds()),
+            max_attempts=min(2, max_rounds - state["rounds"] - int(allow_tools)),
         )
         used = measured_tokens(usage, input_reserve + allowance)
         if used > remaining:
             raise ProjectError("TOKEN_BUDGET", "模型用量超过本轮预算，本轮草稿未保存", 503)
         calls = message.get("tool_calls") or []
         if calls and (
-            state["rounds"] + usage.get("attempts", 1) >= self.runtime.settings.max_rounds
-            or state["calls"] + len(calls) > self.runtime.settings.max_tools
+            state["rounds"] + usage.get("attempts", 1) >= max_rounds
+            or state["calls"] + len(calls) > max_tools
         ):
             raise ProjectError("TOOL_BUDGET", "工具调用达到本轮上限，请缩小问题后重试", 503)
         # Discard provider-specific reasoning fields.

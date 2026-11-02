@@ -8,16 +8,42 @@ from langgraph.types import interrupt
 from backend.agents.common import measured_tokens, request_budget, technology_has_source, tool_json
 from backend.agents.review.prompts import SYSTEM, VERIFY
 from backend.agents.tools.review import TOOLS, ReviewTools, assemble
+from backend.models.documents import split_markdown
 from backend.models.projects import ProjectError
-from backend.models.review import ApplyReview, Verification, split_markdown
+from backend.models.review import ApplyReview, Verification
 
 
 class ReviewNodes:
-    def __init__(self, runtime, store, principal, project_id, item_id, review_id, job):
+    def __init__(self, runtime, store, principal, project_id, item_id, review_id, job, task=None):
         self.runtime, self.store, self.principal = runtime, store, principal
         self.project_id, self.item_id, self.review_id = project_id, item_id, review_id
         self.job = job
+        self.task = task
+        if task:
+            task.validate_scope(principal, project_id, None)
+            if (
+                task.review_id != review_id
+                or task.item_id != item_id
+                or task.item_version != job["source"]["version"]
+                or task.content_hash != job["source"]["hash"]
+            ):
+                raise ProjectError("HANDOFF_CONFLICT", "检查任务资料不匹配，原稿保持不变", 409)
         self.tools = ReviewTools(job["source"])
+
+    @property
+    def max_rounds(self):
+        limit = self.runtime.settings.review_max_rounds
+        return min(limit, self.task.budget.model_calls) if self.task else limit
+
+    @property
+    def max_tools(self):
+        limit = self.runtime.settings.review_max_tools
+        return min(limit, self.task.budget.tool_calls) if self.task else limit
+
+    @property
+    def token_budget(self):
+        limit = self.runtime.settings.review_token_budget
+        return min(limit, self.task.budget.tokens) if self.task else limit
 
     def source_facts(self, state=None):
         facts = dict(self.job["source"]["facts"])
@@ -40,14 +66,15 @@ class ReviewNodes:
         return {"blocks": blocks}
 
     async def model(self, state, messages, tools=None, json_output=False, tool_choice=None):
-        settings = self.runtime.settings
         remaining_time = state["expires_at"] - time.time()
-        if state["rounds"] >= settings.review_max_rounds or remaining_time <= 1:
+        if self.task:
+            remaining_time = min(remaining_time, self.task.budget.seconds())
+        if state["rounds"] >= self.max_rounds or remaining_time <= 1:
             raise ProjectError("REVIEW_BUDGET", "本次检查达到预算，已保留完成内容", 503)
         reserve, allowance = request_budget(
             messages,
             bool(tools),
-            settings.review_token_budget - state["tokens"],
+            self.token_budget - state["tokens"],
             tools=tools,
             max_output=2400 if tools else 1200,
         )
@@ -62,9 +89,7 @@ class ReviewNodes:
             max_output_tokens=allowance,
             timeout_seconds=min(remaining_time, 45),
             tool_choice=tool_choice,
-            max_attempts=min(
-                2, settings.review_max_rounds - state["rounds"] + 1 - int(bool(tools))
-            ),
+            max_attempts=min(2, self.max_rounds - state["rounds"] + 1 - int(bool(tools))),
         )
         state["rounds"] += max(0, usage.get("attempts", 1) - 1)
         used = measured_tokens(usage, reserve + allowance)
@@ -80,12 +105,12 @@ class ReviewNodes:
             duration_ms=round((monotonic() - step) * 1000),
             tokens=used,
         )
-        if state["tokens"] > settings.review_token_budget:
+        if state["tokens"] > self.token_budget:
             raise ProjectError("REVIEW_BUDGET", "本次检查达到预算，已保留完成内容", 503)
         return message
 
     async def assess(self, state):
-        if state["rounds"] >= self.runtime.settings.review_max_rounds - 1:
+        if state["rounds"] >= self.max_rounds - 1:
             return {
                 **state,
                 "pending": [],
@@ -130,8 +155,8 @@ class ReviewNodes:
             "read_ids": state["read_ids"],
             "findings": state["findings"],
             "proposed_blocks": list(dict.fromkeys(c["block_id"] for c in state["changes"])),
-            "remaining_rounds": self.runtime.settings.review_max_rounds - state["rounds"],
-            "remaining_tools": self.runtime.settings.review_max_tools - state["calls"],
+            "remaining_rounds": self.max_rounds - state["rounds"],
+            "remaining_tools": self.max_tools - state["calls"],
         }
         messages = [
             {"role": "system", "content": SYSTEM},
@@ -144,7 +169,7 @@ class ReviewNodes:
             if tool["function"]["name"] != "read_blocks"
             or any(block["id"] not in state["read_ids"] for block in state["blocks"])
         ]
-        concluding = state["rounds"] >= self.runtime.settings.review_max_rounds - 2
+        concluding = state["rounds"] >= self.max_rounds - 2
         if concluding:
             messages.append(
                 {
@@ -166,7 +191,7 @@ class ReviewNodes:
                 else None,
             )
             calls = message.get("tool_calls") or []
-            if not calls and state["rounds"] < self.runtime.settings.review_max_rounds - 1:
+            if not calls and state["rounds"] < self.max_rounds - 1:
                 message = await self.model(
                     state,
                     [
@@ -218,7 +243,7 @@ class ReviewNodes:
     async def act(self, state):
         call, *pending = state["pending"]
         state["calls"] += 1
-        if state["calls"] > self.runtime.settings.review_max_tools:
+        if state["calls"] > self.max_tools:
             state.update(partial=True, complete=True, pending=[])
             return state
         if call["function"]["name"] == "read_customer_sources":

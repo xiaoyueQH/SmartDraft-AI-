@@ -1,9 +1,16 @@
 import unicodedata
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -306,8 +313,17 @@ class DraftItem(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     kind: Kind
     title: str = Field(min_length=1, max_length=160)
-    content: str = Field(min_length=1, max_length=120000)
+    content: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(
+        min_length=1, max_length=120000
+    )
     questions: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("content")
+    @classmethod
+    def nonblank_content(cls, value):
+        if not value.strip():
+            raise ValueError("正文不能只有空白")
+        return value
 
 
 class CreateItem(Command, DraftItem):
@@ -329,9 +345,23 @@ class ItemAction(Command):
         "supplement",
     ]
     title: str = Field(default="", max_length=160)
-    content: str = Field(default="", max_length=120000)
+    content: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(
+        default="", max_length=120000
+    )
     questions: list[str] = Field(default_factory=list, max_length=100)
     note: str = Field(default="", max_length=3000)
+
+    @field_validator("content")
+    @classmethod
+    def nonblank_edit(cls, value):
+        if value and not value.strip():
+            raise ValueError("正文不能只有空白")
+        return value
+
+
+class UndoDocument(Command):
+    expected_version: int = Field(ge=1)
+    change_id: UUID
 
 
 class SendMessage(Command):

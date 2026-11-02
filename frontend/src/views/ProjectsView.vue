@@ -27,6 +27,7 @@ import RequirementDocument from "../components/RequirementDocument.vue";
 import RecordManager from "../components/RecordManager.vue";
 import ConversationPanel from "../components/ConversationPanel.vue";
 import DocumentReview from "../components/DocumentReview.vue";
+import DocumentChange from "../components/DocumentChange.vue";
 import ConversationHistory from "../components/ConversationHistory.vue";
 
 const props = defineProps<{
@@ -78,7 +79,9 @@ const comparison = ref<{
   comparing = ref(false);
 const createdToOpen = ref<Project | null>(null);
 const showNotes = ref(false);
-const documentBusy = ref(false);
+const reviewBusy = ref(false),
+  changeBusy = ref(false);
+const documentBusy = computed(() => reviewBusy.value || changeBusy.value);
 const conversation = ref<ConversationStatus | null>(null);
 const supportChoices = ref<User[]>([]),
   transferTarget = ref("");
@@ -733,14 +736,15 @@ async function openCreatedConsultation(created?: Project) {
     notice.value = `沟通已创建，读取暂未完成：${errorText(error)}。请再次点击“开始需求沟通”继续打开。`;
   }
 }
-async function regenerateRequirements() {
+async function regenerateRequirements(full = false) {
   if (prompt.value.trim()) {
     notice.value = "请先发送或清空当前沟通内容，再整理需求草案";
     return;
   }
   tab.value = "conversation";
-  prompt.value =
-    "请根据我们已经沟通并确认的信息整理需求草案，保留尚未明确的事项，不要自动立项。";
+  prompt.value = full
+    ? "请根据已保存信息重新生成整份需求草案，保留未明确事项，不要自动立项。"
+    : "请将已保存的最新要求更新到当前需求草案，只修改受影响的内容，其他原文保留。";
   await send("draft");
 }
 function openNewItem() {
@@ -1635,9 +1639,17 @@ onUnmounted(() => {
                 !!pending ||
                 !detail.messages.length
               "
-              @click="regenerateRequirements"
+              @click="regenerateRequirements()"
             >
-              重新整理草案
+              更新需求
+            </button>
+            <button
+              v-if="detail.project.consultation?.status === 'draft_ready'"
+              class="text-button"
+              :disabled="!configured || running || saving || !!pending"
+              @click="regenerateRequirements(true)"
+            >
+              重新生成整份
             </button>
             <section
               v-if="detail.project.consultation?.suggestions?.length"
@@ -1858,6 +1870,25 @@ onUnmounted(() => {
       >
         原请求重试
       </button>
+      <p
+        v-if="
+          opened && isDocument && detail?.project.consultation?.document_pending
+        "
+        class="notice notice-warning"
+      >
+        沟通已保存，尚有要求未同步到需求书；可明确告诉顾问更新需求。
+      </p>
+      <DocumentChange
+        v-if="opened && isDocument"
+        :key="`${selected}:${opened.id}`"
+        :project-id="selected"
+        :item="opened"
+        :locked="
+          saving || !!pending || editing || !!actionConfirmation || reviewBusy
+        "
+        @changed="documentChanged"
+        @busy="changeBusy = $event"
+      />
       <DocumentReview
         v-if="opened && isDocument"
         v-show="!editing && !actionConfirmation"
@@ -1867,7 +1898,7 @@ onUnmounted(() => {
         :configured="configured"
         :locked="saving || !!pending || editing || !!actionConfirmation"
         @changed="documentChanged"
-        @busy="documentBusy = $event"
+        @busy="reviewBusy = $event"
       />
       <form v-if="editing" @submit.prevent="saveItem">
         <label v-if="!opened"

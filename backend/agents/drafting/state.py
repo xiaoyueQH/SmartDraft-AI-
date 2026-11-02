@@ -4,7 +4,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.agents.common import supported_technical_fact, technology_has_source
 from backend.models.consultation import Reference
-from backend.models.drafting import DraftAssumption, DraftPlan, DraftSection
+from backend.models.drafting import DraftAssumption, DraftPlan, DraftSection, RevisionPlan
+from backend.models.handoff import AgentTask
 
 
 class GraphState(TypedDict):
@@ -23,6 +24,8 @@ class DraftState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     business_notes: dict[str, Any] = Field(default_factory=dict)
+    handoff: AgentTask | None = None
+    handoff_counters: dict[str, int] = Field(default_factory=dict)
     user_request: str = ""
     customer_statements: list[str] = Field(default_factory=list)
     plan: DraftPlan | None = None
@@ -43,6 +46,13 @@ class DraftState(BaseModel):
     original_blocks: list[dict[str, Any]] = Field(default_factory=list)
     replacement: dict[str, Any] = Field(default_factory=dict)
     original_questions: list[str] = Field(default_factory=list)
+    incremental: bool = False
+    revision_plan: RevisionPlan | None = None
+    read_ids: list[str] = Field(default_factory=list)
+    verified: bool = False
+    verification_attempted: bool = False
+    no_change: bool = False
+    fixed_protected: list[str] = Field(default_factory=list)
 
     def observations(self):
         """The current State is authoritative; keep the latest complete native tool exchange."""
@@ -90,6 +100,9 @@ class DraftState(BaseModel):
                 for b in self.original_blocks
             ],
             "revision_mode": bool(self.original_blocks),
+            "incremental": self.incremental,
+            "revision_plan": self.revision_plan.model_dump() if self.revision_plan else None,
+            "read_block_ids": self.read_ids,
         }
         if include_written:
             data["written_sections"] = {

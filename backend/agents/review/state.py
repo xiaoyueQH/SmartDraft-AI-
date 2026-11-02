@@ -2,6 +2,7 @@ from typing import Any, TypedDict
 
 
 class ReviewState(TypedDict):
+    task: dict[str, Any]
     blocks: list[dict[str, Any]]
     read_ids: list[str]
     findings: list[dict[str, Any]]

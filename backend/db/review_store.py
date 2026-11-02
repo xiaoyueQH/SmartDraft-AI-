@@ -5,8 +5,9 @@ from sqlalchemy import literal, or_, select, union_all
 
 from backend.db.job_store import enqueue, protected
 from backend.db.project_store import ProjectStore, fingerprint, now, remember_revision, view
+from backend.models.documents import content_hash
 from backend.models.projects import Project, ProjectError, ProjectItem, ProjectMessage, ProjectRun
-from backend.models.review import DocumentReview, DocumentRevision, content_hash
+from backend.models.review import DocumentReview, DocumentRevision
 
 
 class ReviewStore(ProjectStore):
@@ -230,7 +231,10 @@ class ReviewStore(ProjectStore):
                 "source_overflow": overflow,
                 "assumptions": (project.consultation or {}).get("draft_assumptions", []),
             }
-            blocks = previous.blocks if previous else []
+            index = await self._document_index(session, document)
+            if index.status != "ready":
+                raise ProjectError("DOCUMENT_INDEX_LIMIT", "文档结构较多，请分阶段检查", 503)
+            blocks = index.read_blocks(document.content)
             row = DocumentReview(
                 id=uuid4(),
                 project_id=project_id,
@@ -399,6 +403,7 @@ class ReviewStore(ProjectStore):
                 ):
                     raise ProjectError("PROJECT_BUSY", "顾问正在处理本项目，请稍后应用修改")
                 await remember_revision(session, document, actor.id, "before_review", review.blocks)
+                await self._clear_document_change(session, document.id)
                 document.content = review.candidate
                 document.questions = list(
                     dict.fromkeys([*document.questions, *review.report.get("questions", [])])
@@ -412,6 +417,7 @@ class ReviewStore(ProjectStore):
                 document.version += 1
                 project.version += 1
                 review.status = "applied"
+                await self._document_index(session, document)
             await session.flush()
             return self._record(
                 session,
@@ -460,7 +466,10 @@ class ReviewStore(ProjectStore):
                 raise ProjectError("IMMUTABLE_ITEM", "正式版本不可覆盖，请新建需求变更")
             if document.version != data.expected_version:
                 raise ProjectError("VERSION_CONFLICT", "正文已更新，请重新核对后恢复")
-            await remember_revision(session, document, actor.id, "before_restore")
+            index = await self._document_index(session, document)
+            blocks = index.read_blocks(document.content) if index.status == "ready" else None
+            await remember_revision(session, document, actor.id, "before_restore", blocks)
+            await self._clear_document_change(session, document.id)
             document.title, document.content, document.questions = (
                 revision.title,
                 revision.content,
@@ -474,6 +483,7 @@ class ReviewStore(ProjectStore):
             document.base_revision = project.revision
             document.version += 1
             project.version += 1
+            await self._document_index(session, document)
             await session.flush()
             return self._record(
                 session,

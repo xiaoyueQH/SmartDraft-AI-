@@ -71,3 +71,46 @@ class DraftFinish(BaseModel):
         max_length=20,
         description="仅汇总自动生成的实现选择，不得把客户已指定的内容标为自动选择。",
     )
+
+
+class RevisionPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    targets: list[str] = Field(max_length=6, description="实际需要修改的原块ID；无需变化时为空")
+    related: list[str] = Field(
+        default_factory=list, max_length=20, description="只需读取核对的关联块"
+    )
+    protected: list[str] = Field(
+        default_factory=list, max_length=20, description="客户禁止改动的块"
+    )
+    rationale: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def valid_sets(self):
+        if len(set(self.targets)) != len(self.targets) or set(self.targets) & set(self.protected):
+            raise ValueError("修改范围重复或包含受保护块")
+        return self
+
+
+class ReadRevisionBlocks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[str] = Field(min_length=1, max_length=4)
+
+
+class RevisionVerification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passed: bool
+    explanation: str = Field(min_length=1, max_length=1000)
+
+
+class RevisionCommit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    version: int = Field(ge=1)
+    title: str
+    hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    incremental: Literal[True]
+    replacements: dict[str, str] = Field(max_length=6)
+    target_ids: list[str] = Field(max_length=6)
+    read_ids: list[str] = Field(max_length=100)
+    related_ids: list[str] = Field(max_length=20)
+    protected_ids: list[str] = Field(max_length=100)

@@ -20,6 +20,7 @@ from backend.models.projects import (
     ProjectError,
     SendMessage,
     StartConsultation,
+    UndoDocument,
 )
 
 router = APIRouter(prefix="/projects", tags=["software-projects"])
@@ -113,6 +114,35 @@ async def comparison(
     expected_version: Annotated[int, Query(ge=1)],
 ):
     return await store.comparison(principal, project_id, item_id, expected_version)
+
+
+@router.get("/{project_id}/items/{item_id}/blocks")
+async def document_blocks(
+    project_id: UUID,
+    item_id: UUID,
+    principal: PrincipalDep,
+    store: StoreDep,
+    expected_version: Annotated[int | None, Query(ge=1)] = None,
+):
+    return await store.document_index(principal, project_id, item_id, expected_version)
+
+
+@router.get("/{project_id}/items/{item_id}/latest-change")
+async def latest_document_change(
+    project_id: UUID, item_id: UUID, principal: PrincipalDep, store: StoreDep
+):
+    return await store.latest_document_change(principal, project_id, item_id)
+
+
+@router.post("/{project_id}/items/{item_id}/undo-change")
+async def undo_document_change(
+    project_id: UUID,
+    item_id: UUID,
+    data: UndoDocument,
+    principal: PrincipalDep,
+    store: StoreDep,
+):
+    return await store.undo_document_change(principal, project_id, item_id, data)
 
 
 @router.post("/{project_id}/items/{item_id}/actions")

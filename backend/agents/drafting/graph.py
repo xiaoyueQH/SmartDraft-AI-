@@ -11,32 +11,45 @@ from backend.agents.drafting.nodes import DraftNodes
 from backend.agents.drafting.state import DraftState, GraphState
 from backend.db.checkpoints import DatabaseCheckpointer
 from backend.db.tool_store import ToolStore
+from backend.models.documents import split_markdown
+from backend.models.handoff import AgentResult, AgentTask, digest
 from backend.models.projects import DraftItem, ProjectError
-from backend.models.review import split_markdown
 
 
 def after_tools(state):
     if state["pending"]:
         return "tools"
     draft = state["draft"]
+    if draft.get("incremental") and draft.get("revision_plan"):
+        revision = draft["revision_plan"]
+        if (
+            set(revision["targets"]) == set(draft["sections"])
+            and set([*revision["targets"], *revision["related"]]) <= set(draft["read_ids"])
+            and draft["read_ids"]
+        ):
+            return "verify"
     plan = draft["plan"]
     if draft["status"] != "working" or (
         plan
         and not draft["failures"]
         and all(section["id"] in draft["sections"] for section in plan["sections"])
     ):
-        return "finalize"
+        return "verify"
     return "decide"
 
 
 def build_graph(nodes, checkpointer):
     graph = StateGraph(GraphState)
+    graph.add_node("prepare_document", nodes.node(nodes.prepare_document))
     graph.add_node("decide", nodes.node(nodes.decide))
     graph.add_node("tools", nodes.node(nodes.tools))
     graph.add_node("finalize", nodes.node(nodes.finalize))
-    graph.add_edge(START, "decide")
-    graph.add_conditional_edges("decide", lambda state: "tools" if state["pending"] else "finalize")
+    graph.add_node("verify", nodes.node(nodes.verify))
+    graph.add_edge(START, "prepare_document")
+    graph.add_edge("prepare_document", "decide")
+    graph.add_conditional_edges("decide", lambda state: "tools" if state["pending"] else "verify")
     graph.add_conditional_edges("tools", after_tools)
+    graph.add_edge("verify", "finalize")
     graph.add_edge("finalize", END)
     return graph.compile(checkpointer=checkpointer)
 
@@ -189,7 +202,11 @@ async def create_draft(flow, *, checkpointer=None):
             )
         ],
     ).model_copy(deep=True)
-    if draft_revision_requested(draft_state.user_request):
+    original = None
+    action = getattr(flow, "document_action", None)
+    if action in {"revise", "fill"} or (
+        action is None and draft_revision_requested(draft_state.user_request)
+    ):
         original = await flow.store.draft_target(
             flow.principal, flow.project_id, flow.snapshot["project"]["version"]
         )
@@ -197,15 +214,40 @@ async def create_draft(flow, *, checkpointer=None):
             raise ProjectError(
                 "DRAFT_REVISION_MISSING", "没有可以补写的草稿；正式版本请通过需求变更处理", 409
             )
-        draft_state.original_blocks = split_markdown(original["content"])
-        for block in draft_state.original_blocks:
-            block["id"] = f"existing-{block['position'] + 1}"
+        draft_state.original_blocks = original.get("blocks") or split_markdown(original["content"])
         draft_state.original_questions = list(original["questions"])
+        draft_state.incremental = bool(getattr(flow, "task", None))
         draft_state.replacement = {
             "id": original["id"],
             "version": original["version"],
             "title": original["title"],
+            "hash": hashlib.sha256(original["content"].encode()).hexdigest(),
         }
+    if getattr(flow, "task", None) is not None:
+        try:
+            flow.task.validate_scope(flow.principal, flow.project_id, flow.run_id)
+        except ValueError as error:
+            raise ProjectError("HANDOFF_CONFLICT", "任务与当前项目或登录不匹配", 409) from error
+        parent = AgentTask.model_validate(
+            {
+                **flow.task.model_dump(),
+                "project_version": flow.snapshot["project"]["version"],
+                "facts_hash": digest(notes),
+                "allow_search": flow.task.allow_search and bool(flow.options.get("web_search")),
+            }
+        )
+        draft_state.handoff_counters = {
+            "models": flow.rounds,
+            "tools": flow.calls,
+            "tokens": flow.tokens,
+        }
+        draft_state.handoff = parent.delegate_document(
+            action or "create",
+            budget=parent.budget.remaining(**draft_state.handoff_counters),
+            source_ids=(f"run:{flow.run_id}",),
+            item=original,
+        )
+        flow.document_task = draft_state.handoff
     nodes = DraftNodes(flow, draft_state)
     body, partial = await run_graph(nodes, checkpointer=checkpointer)
     if (
@@ -220,6 +262,41 @@ async def create_draft(flow, *, checkpointer=None):
     if draft_state.assumptions and (draft_state.sections or draft_state.direct_body):
         flow.state.draft_assumptions = draft_state.assumptions
     if draft_state.original_blocks:
+        if draft_state.incremental:
+            if partial or not draft_state.verified:
+                raise ProjectError(
+                    "DRAFT_REVISION_INCOMPLETE", "本次关联更新未完成，原稿保持不变", 503
+                )
+            original_body = "".join(b["content"] for b in draft_state.original_blocks)
+            no_change = body == original_body
+            document = DraftItem(
+                kind="specification",
+                title=draft_state.replacement["title"],
+                content=body,
+                questions=draft_state.original_questions,
+            )
+            replacement = {
+                **draft_state.replacement,
+                "incremental": True,
+                "replacements": draft_state.sections,
+                "target_ids": draft_state.revision_plan.targets,
+                "read_ids": draft_state.read_ids,
+                "related_ids": draft_state.revision_plan.related,
+                "protected_ids": list(
+                    set([*draft_state.revision_plan.protected, *draft_state.fixed_protected])
+                ),
+            }
+            return {
+                "document": document.model_dump(),
+                "partial": False,
+                "replacement": replacement,
+                "no_change": no_change,
+                "handoff": AgentResult.for_task(
+                    draft_state.handoff,
+                    outcome="no_change" if no_change else "completed",
+                    content=body,
+                ).model_dump(mode="json"),
+            }
         if not draft_state.sections:
             raise ProjectError("DRAFT_REVISION_EMPTY", "没有完成章节补写，原稿保持不变", 503)
         revised_titles = [
@@ -245,11 +322,16 @@ async def create_draft(flow, *, checkpointer=None):
             questions=questions,
         )
         await flow.event("draft_complete", "已补写指定章节，其他内容保持不变")
-        return {
+        result = {
             "document": document.model_dump(),
             "partial": partial,
             "replacement": draft_state.replacement,
         }
+        if draft_state.handoff:
+            result["handoff"] = AgentResult.for_task(
+                draft_state.handoff, outcome="partial" if partial else "completed", content=body
+            ).model_dump(mode="json")
+        return result
     body = (
         "本草案根据客户要求和自动补充方案整理，尚未立项。"
         "用户未明确选择的设计属于【自动生成】方案，可调整，不代表用户已选择或确认；"
@@ -277,4 +359,9 @@ async def create_draft(flow, *, checkpointer=None):
     document = DraftItem(
         kind="specification", title=title[:150] + "需求草案", content=body, questions=questions
     )
-    return {"document": document.model_dump(), "partial": partial}
+    result = {"document": document.model_dump(), "partial": partial}
+    if draft_state.handoff:
+        result["handoff"] = AgentResult.for_task(
+            draft_state.handoff, outcome="partial" if partial else "completed", content=body
+        ).model_dump(mode="json")
+    return result

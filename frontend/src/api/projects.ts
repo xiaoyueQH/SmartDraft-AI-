@@ -22,6 +22,7 @@ export interface Project {
     draft_consent: boolean;
     draft_paused?: boolean;
     memory_pending?: boolean;
+    document_pending?: boolean;
     gaps: { key: string; question: string; critical: boolean }[];
     conflicts: { key: string; question: string; critical: boolean }[];
     references: {

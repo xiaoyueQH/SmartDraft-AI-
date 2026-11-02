@@ -1,7 +1,53 @@
 import json
 import re
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
+from backend.models.handoff import AgentTask, TaskBudget, digest
 from backend.models.projects import ProjectError
+
+
+def route_agent(
+    phase, *, silent=False, review=False, mode="ai", manual_document=False, accepted=False
+):
+    if review:
+        return "review"
+    if silent:
+        return "consultation"
+    if mode == "human" and not manual_document:
+        raise ProjectError("HUMAN_MODE", "当前由人工接待，AI不会自动回复", 409)
+    if mode == "pending" and not accepted:
+        raise ProjectError("HUMAN_PENDING", "正在交接人工，不启动新的AI回复", 409)
+    if phase not in {"discovery", "project"}:
+        raise ProjectError("PROJECT_PHASE", "项目状态已变化，请刷新后重试", 409)
+    return "consultation" if phase == "discovery" else "project"
+
+
+def execution_task(
+    principal, project, run_id, settings, *, agent, silent=False, seconds=None, allow_search=False
+):
+    drafting = agent == "consultation" and not silent
+    prefix = "draft_" if drafting else ""
+    return AgentTask(
+        task_id=run_id,
+        run_id=run_id,
+        project_id=UUID(str(project["id"])),
+        actor_id=principal.account.id,
+        session_id=principal.session_id,
+        agent=agent,
+        action="record" if silent else "chat",
+        project_version=project["version"],
+        facts_hash=digest(project.get("discovery") or {}),
+        allow_search=allow_search and not silent,
+        budget=TaskBudget(
+            model_calls=getattr(settings, prefix + "max_rounds"),
+            tool_calls=getattr(settings, prefix + "max_tools"),
+            tokens=getattr(settings, prefix + "token_budget"),
+            deadline=datetime.now(UTC)
+            + timedelta(seconds=seconds or getattr(settings, prefix + "run_seconds")),
+            save_seconds=12 if drafting else 0,
+        ),
+    )
 
 
 def draft_revision_requested(text):

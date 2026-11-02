@@ -11,7 +11,7 @@ from test_projects import act, draft, project
 from backend.agents.runtime import AgentRuntime
 from backend.agents.tools.review import ReviewTools, assemble
 from backend.db.checkpoints import DatabaseCheckpointer
-from backend.models.review import split_markdown
+from backend.models.documents import split_markdown
 
 SOURCE = (
     "# 系统说明\n\n## 取消预约\n已取消的预约仍占用时间。\n\n## 验收\n取消后他人能预约相同时段。"

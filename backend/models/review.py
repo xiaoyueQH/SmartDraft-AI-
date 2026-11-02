@@ -1,97 +1,13 @@
-import hashlib
 from datetime import datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from markdown_it import MarkdownIt
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.models.orm import Base
 from backend.models.projects import Command
-
-
-def content_hash(content):
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def split_markdown(content, previous=()):
-    """Lossless source slices; parser headings never mistake fenced SQL/Mermaid for sections."""
-    lines = content.splitlines(keepends=True)
-    tokens = MarkdownIt("commonmark").enable("table").parse(content)
-    headings = []
-    for index, token in enumerate(tokens):
-        if token.type == "heading_open" and token.level == 0 and token.map:
-            level = int(token.tag[1])
-            if level <= 3:
-                headings.append((token.map[0], level, tokens[index + 1].content))
-    primary = [row for row in headings if row[1] <= 2]
-    if not primary:
-        primary = headings
-    boundaries = {0: (0, "文档说明")}
-    for position, (start, level, title) in enumerate(primary):
-        boundaries[start] = (level, title)
-        end = primary[position + 1][0] if position + 1 < len(primary) else len(lines)
-        if sum(len(line) for line in lines[start:end]) > 6000:
-            for sub_start, sub_level, sub_title in headings:
-                if start < sub_start < end:
-                    boundaries[sub_start] = (sub_level, sub_title)
-    # Long sections without subheadings split only between complete top-level Markdown blocks.
-    offsets = [0]
-    for line in lines:
-        offsets.append(offsets[-1] + len(line))
-    sections = sorted(boundaries)
-    atomic_starts = sorted({token.map[0] for token in tokens if token.level == 0 and token.map})
-    for position, start in enumerate(sections):
-        end = sections[position + 1] if position + 1 < len(sections) else len(lines)
-        if offsets[end] - offsets[start] <= 12000:
-            continue
-        anchor = start
-        level, title = boundaries[start]
-        for boundary in atomic_starts:
-            if anchor < boundary < end and offsets[boundary] - offsets[anchor] >= 6000:
-                boundaries[boundary] = (level, title + "（续）")
-                anchor = boundary
-    starts = sorted(boundaries)
-    blocks = []
-    for ordinal, start in enumerate(starts):
-        end = starts[ordinal + 1] if ordinal + 1 < len(starts) else len(lines)
-        body = "".join(lines[start:end])
-        if not body:
-            continue
-        level, title = boundaries[start]
-        blocks.append(
-            {
-                "id": "",
-                "title": title,
-                "level": level,
-                "content": body,
-                "hash": content_hash(body),
-                "position": len(blocks),
-            }
-        )
-    unused = list(previous)
-    for block in blocks:
-        match = next((old for old in unused if old["hash"] == block["hash"]), None)
-        if match is None:
-            choices = [
-                old
-                for old in unused
-                if old["title"] == block["title"] and old["level"] == block["level"]
-            ]
-            if len(choices) == 1:
-                match = choices[0]
-        if match:
-            block["id"] = match["id"]
-            unused.remove(match)
-    unknown = [block for block in blocks if not block["id"]]
-    if len(unknown) == len(unused) == 1:
-        unknown[0]["id"] = unused[0]["id"]
-    for block in blocks:
-        if not block["id"]:
-            block["id"] = str(uuid4())
-    return blocks
 
 
 class DocumentReview(Base):

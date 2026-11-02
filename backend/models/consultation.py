@@ -286,6 +286,7 @@ class ConsultationState(BaseModel):
     last_run_id: str = ""
     discussion_run_id: str = ""
     memory_pending: bool = False
+    document_pending: bool = False
     asked_questions: list[str] = Field(default_factory=list, max_length=30)
     checkpoint_thread: str = ""
     pending_search_query: str = Field(default="", max_length=120)
