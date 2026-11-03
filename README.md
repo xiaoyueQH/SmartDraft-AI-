@@ -82,6 +82,8 @@ npm run dev
 
 Compose当前只提供PostgreSQL和Redis；API、Worker与前端分别通过上面的本机命令启动，不是Docker全栈部署。
 
+公网演示请使用HTTPS，不能把本机localhost能用等同于公网HTTP可用。`randomUUID`和登录续期所需Web Locks受到安全上下文限制。域名/IP证书、Nginx同源代理及临时SSH演示说明见[服务器部署与演示](docs/服务器部署与演示.md)。
+
 | 服务 / 页面 | 默认地址                                 |
 | ----------- | ---------------------------------------- |
 | 客户工作区  | http://127.0.0.1:5183/#/                 |

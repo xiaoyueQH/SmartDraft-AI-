@@ -68,6 +68,7 @@ scripts/                     启动、迁移、账号维护
 - JWT access/轮换refresh始终启用；角色、账号和登录有效性从PG复核，退出/停用/改密撤销旧登录。固定HS256，校验用途和标准声明。
 - access只在标签页内存，refresh按sid独立HttpOnly/SameSite Strict Cookie，sessionStorage只存sid。JWT不能进URL/localStorage/sessionStorage。
 - 同sid刷新用Web Locks；不支持时拒绝不安全刷新。BroadcastChannel只传撤销ID，账号切换取消旧请求、丢弃旧响应并重建受保护页面。
+- 公网演示使用受信任HTTPS；localhost本机可信例外不代表公网HTTP可用。请求ID统一从frontend/src/api/request-id.ts生成，randomUUID不可用时用getRandomValues构造UUID v4，不用Math.random/时间戳；不为HTTP演示取消Web Locks续期保护。部署入口与IP证书说明见docs/服务器部署与演示.md。
 - Origin、受信任代理、账号/客户端登录预算由服务端控制；Argon2计算移出事件循环并限制并发，不在计算时占SQL会话。
 - 锁顺序user → login → project → item/run，锁等待1.5秒；事务中复核身份/归属，越权与不存在统一404。
 - 业务写入的用户锁用FOR NO KEY UPDATE，保留按操作者串行及与改密/停用的互斥，同时兼容其他事务的用户外键KEY SHARE检查；不要改回完整FOR UPDATE导致接管/巡检与页面读取死锁。账号维护仍使用原有强锁。

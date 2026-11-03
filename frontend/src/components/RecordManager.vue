@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { requestId } from "../api/request-id";
 import { computed, onUnmounted, ref, watch } from "vue";
 import { auth } from "../auth/session";
 import { ApiError } from "../auth/client";
@@ -127,7 +128,7 @@ async function submit() {
   )
     return;
   pending.value = JSON.stringify({
-    request_id: crypto.randomUUID(),
+    request_id: requestId(),
     action:
       mode.value === "rename" ? "rename" : deleted.value ? "restore" : "trash",
     title: mode.value === "rename" ? title.value.trim() : "",

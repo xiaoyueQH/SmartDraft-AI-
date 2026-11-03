@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { requestId } from "../api/request-id";
 import { computed, onUnmounted, ref, watch } from "vue";
 import { auth } from "../auth/session";
 import { ApiError } from "../auth/client";
@@ -79,7 +80,7 @@ async function undo() {
   pending.value = {
     path: `/api/projects/${props.projectId}/items/${props.item.id}/undo-change`,
     body: JSON.stringify({
-      request_id: crypto.randomUUID(),
+      request_id: requestId(),
       expected_version: props.item.version,
       change_id: latest.value.change.id,
     }),

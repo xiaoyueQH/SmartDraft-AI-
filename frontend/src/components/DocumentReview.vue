@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { requestId } from "../api/request-id";
 import { computed, onUnmounted, ref, watch } from "vue";
 import { auth } from "../auth/session";
 import { ApiError } from "../auth/client";
@@ -157,7 +158,7 @@ async function retry() {
 function start() {
   return mutate(
     `${base.value}/reviews`,
-    { request_id: crypto.randomUUID(), expected_version: props.item.version },
+    { request_id: requestId(), expected_version: props.item.version },
     "start",
   );
 }
@@ -166,7 +167,7 @@ function decide(decision: "apply" | "discard") {
   return mutate(
     `${base.value}/reviews/${review.value.id}/decision`,
     {
-      request_id: crypto.randomUUID(),
+      request_id: requestId(),
       expected_version: props.item.version,
       decision,
     },
@@ -194,7 +195,7 @@ function restore() {
   if (!target) return;
   return mutate(
     `${base.value}/history/${target.id}/restore`,
-    { request_id: crypto.randomUUID(), expected_version: props.item.version },
+    { request_id: requestId(), expected_version: props.item.version },
     "restore",
   );
 }

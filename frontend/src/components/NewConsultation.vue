@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { requestId } from "../api/request-id";
 import { ref, onUnmounted } from "vue";
 import { auth } from "../auth/session";
 import { ApiError, type User } from "../auth/client";
@@ -40,7 +41,7 @@ function close() {
 async function submit() {
   if (saving.value || loading.value || !owner.value) return;
   pending.value ||= JSON.stringify({
-    request_id: crypto.randomUUID(),
+    request_id: requestId(),
     owner_id: owner.value,
   });
   saving.value = true;

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { requestId } from "../api/request-id";
 import { onMounted, onUnmounted, ref } from "vue";
 import { onBeforeRouteLeave } from "vue-router";
 import { auth } from "../auth/session";
@@ -32,7 +33,7 @@ async function load() {
 async function toggle() {
   if (saving.value || loading.value) return;
   pending.value ||= JSON.stringify({
-    request_id: crypto.randomUUID(),
+    request_id: requestId(),
     expected_version: version.value,
     enabled: !enabled.value,
   });

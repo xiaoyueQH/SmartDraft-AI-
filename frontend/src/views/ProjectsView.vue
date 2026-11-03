@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { requestId } from "../api/request-id";
 import {
   computed,
   nextTick,
@@ -186,7 +187,7 @@ async function controlConversation(action: string) {
   const id = selected.value,
     current = generation;
   const result = await write(`/api/projects/${id}/conversation/actions`, {
-    request_id: crypto.randomUUID(),
+    request_id: requestId(),
     expected_version: conversation.value.version,
     action,
     support_id: action === "transfer" ? transferTarget.value : undefined,
@@ -709,7 +710,7 @@ async function createConsultation() {
   starting.value = true;
   try {
     const result = await write("/api/consultations", {
-      request_id: crypto.randomUUID(),
+      request_id: requestId(),
       owner_id: admin.value ? selectedCustomer.value : undefined,
     });
     if (!result) return;
@@ -949,14 +950,14 @@ async function saveItem() {
     ? await write(
         `/api/projects/${selected.value}/items/${opened.value.id}/actions`,
         {
-          request_id: crypto.randomUUID(),
+          request_id: requestId(),
           expected_version: opened.value.version,
           action: "edit",
           ...content,
         },
       )
     : await write(`/api/projects/${selected.value}/items`, {
-        request_id: crypto.randomUUID(),
+        request_id: requestId(),
         kind: itemForm.kind,
         base_revision: detail.value.project.revision,
         ...content,
@@ -1025,7 +1026,7 @@ async function performAction(value: string, version: number, note: string) {
   const result = await write(
     `/api/projects/${selected.value}/items/${opened.value.id}/actions`,
     {
-      request_id: crypto.randomUUID(),
+      request_id: requestId(),
       expected_version: version,
       action: value,
       note,
@@ -1086,7 +1087,7 @@ async function send(
   )
     return;
   const result = await write(`/api/projects/${id}/messages`, {
-    request_id: crypto.randomUUID(),
+    request_id: requestId(),
     content: prompt.value.trim(),
     intent,
     web_search: searchAvailable.value && webSearch.value,

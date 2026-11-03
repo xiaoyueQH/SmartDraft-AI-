@@ -222,7 +222,7 @@ export class SessionClient {
     if (this.refreshFlight) return this.refreshFlight;
     if (!this.locks)
       throw new ApiError(
-        "当前浏览器不支持安全续期，请更新浏览器，并使用安全连接访问。",
+        "当前连接无法安全续期。请使用 HTTPS 或本机 localhost 地址访问；若已使用安全连接，请更新浏览器。",
         0,
         "SESSION_LOCK_UNAVAILABLE",
       );

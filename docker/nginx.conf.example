@@ -1,0 +1,48 @@
+# HTTPS template, included inside Nginx's http {}. Obtain the certificate first.
+# Replace demo.example.com and /srv/supportflow/frontend/dist for your deployment.
+# For an IP certificate replace server_name with that IP; keep cert-name supportflow.
+server {
+    listen 80;
+    server_name demo.example.com;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        try_files $uri =404;
+    }
+
+    location / {
+        return 308 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name demo.example.com;
+    ssl_certificate /etc/letsencrypt/live/supportflow/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/supportflow/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root /srv/supportflow/frontend/dist;
+    index index.html;
+    client_max_body_size 2m;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8091;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_next_upstream off;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

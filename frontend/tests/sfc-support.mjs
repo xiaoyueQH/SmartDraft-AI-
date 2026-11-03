@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import * as requestIds from "../src/api/request-id.ts";
 
 import { JSDOM } from "jsdom";
 import ts from "typescript";
@@ -42,7 +43,12 @@ export function component(file, session, extra = {}) {
     },
   });
   const exports = {};
-  const dependencies = { vue, "vue-router": vueRouter, ...extra };
+  const dependencies = {
+    vue,
+    "vue-router": vueRouter,
+    "../api/request-id": requestIds,
+    ...extra,
+  };
   new Function("require", "exports", outputText)((name) => {
     if (name.endsWith("auth/session")) return session;
     if (dependencies[name]) return dependencies[name];
